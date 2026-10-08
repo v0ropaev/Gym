@@ -44,6 +44,18 @@ The claim is a file named for the ID in a subdirectory of the socket directory.
 A seed or close for that ID without a cookie naming its owner is forwarded to the claimant (see ``SessionClaims``).
 A claim ends once its owner keeps nothing of the session,
 and the directory goes with the socket directory when the server exits.
+
+A request that belongs to a worker without a session, such as an agent's call to itself within one ``/run``,
+names that worker in the ``x-ng-session-owner`` header instead.
+
+A partial-rollout checkpoint restore installs the sessions of each worker that ran
+before a crash on one live worker,
+and adds an entry from the old worker ID to the new one to the alias table (see
+``nemo_gym._checkpoint.participant_workers``).
+Requests whose cookie or token names an old worker then reach the worker that holds its sessions now.
+Sessions checkpointed by a single-process server name no worker;
+a restore places each on a worker and records it in the placement table, by session ID,
+that the router consults for a cookie or token without an owner.
 """
 
 import asyncio
@@ -81,6 +93,12 @@ from nemo_gym.runtime_dir import server_runtime_dir
 SESSION_SOCKET_DIR_ENV = "NEMO_GYM_SESSION_SOCKET_DIR"
 #: Session key naming the worker that created the session.
 SESSION_OWNER_KEY = "nemo_gym_worker"
+#: Session key of the session ID; ``nemo_gym.server_utils.SESSION_ID_KEY`` is defined from it.
+SESSION_ID_CLAIM = "session_id"
+#: MCP session token key of the session ID (see ``nemo_gym.mcp_auto_exposure``).
+_MCP_SESSION_ID_CLAIM = "sid"
+#: Header naming the worker a request belongs to, for a request without a session.
+SESSION_OWNER_HEADER = "x-ng-session-owner"
 #: Scope key marking a request that arrived over a worker's private socket.
 _FORWARDED_SCOPE_KEY = "nemo_gym.session_forwarded"
 
@@ -147,6 +165,34 @@ def _valid_routing_id(owner: Any) -> Optional[str]:
     return owner if isinstance(owner, str) and _ROUTING_ID_PATTERN.fullmatch(owner) else None
 
 
+def session_aliases(app: FastAPI) -> dict[str, str]:
+    """The app's table of restored session owners: an old worker ID to the live worker that holds its sessions."""
+    if not hasattr(app.state, "nemo_gym_session_aliases"):
+        app.state.nemo_gym_session_aliases = {}
+    return app.state.nemo_gym_session_aliases
+
+
+def session_placements(app: FastAPI) -> dict[str, str]:
+    """The app's table of restored sessions that name no owner: a session ID to the worker that holds it."""
+    if not hasattr(app.state, "nemo_gym_session_placements"):
+        app.state.nemo_gym_session_placements = {}
+    return app.state.nemo_gym_session_placements
+
+
+def _cookie_claims(cookie: str, *, signer: itsdangerous.TimestampSigner) -> Any:
+    try:
+        return json.loads(b64decode(signer.unsign(cookie.encode("utf-8"), max_age=_SESSION_MAX_AGE_SECONDS)))
+    except (itsdangerous.BadSignature, ValueError):
+        return None
+
+
+def _token_claims(token: str, *, serializer: itsdangerous.URLSafeSerializer) -> Any:
+    try:
+        return serializer.loads(token)
+    except itsdangerous.BadSignature:
+        return None
+
+
 def session_owner(cookie: str, *, signer: itsdangerous.TimestampSigner) -> Optional[str]:
     """Return the worker ID stamped in a session cookie, or None if there is no valid one.
 
@@ -154,12 +200,7 @@ def session_owner(cookie: str, *, signer: itsdangerous.TimestampSigner) -> Optio
     A cookie it would reject (badly signed or expired) starts a fresh session,
     which belongs to whichever worker handles the request.
     """
-    try:
-        return _valid_owner(
-            json.loads(b64decode(signer.unsign(cookie.encode("utf-8"), max_age=_SESSION_MAX_AGE_SECONDS)))
-        )
-    except (itsdangerous.BadSignature, ValueError):
-        return None
+    return _valid_owner(_cookie_claims(cookie, signer=signer))
 
 
 def mcp_token_owner(token: str, *, serializer: itsdangerous.URLSafeSerializer) -> Optional[str]:
@@ -167,10 +208,7 @@ def mcp_token_owner(token: str, *, serializer: itsdangerous.URLSafeSerializer) -
 
     A rejected token is handled locally, where the MCP endpoint's own token check refuses it as before.
     """
-    try:
-        return _valid_owner(serializer.loads(token))
-    except itsdangerous.BadSignature:
-        return None
+    return _valid_owner(_token_claims(token, serializer=serializer))
 
 
 class AgentSessionHolder(Protocol):
@@ -337,6 +375,8 @@ class SessionRoutingMiddleware:
         session_cookie: str,
         secret_key: str,
         clients: dict[str, ClientSession],
+        aliases: Optional[dict[str, str]] = None,
+        placements: Optional[dict[str, str]] = None,
         mcp_token_header: Optional[str] = None,
         mcp_token_serializer: Optional[itsdangerous.URLSafeSerializer] = None,
         mcp_path: str = "/mcp",
@@ -350,6 +390,10 @@ class SessionRoutingMiddleware:
         self.signer = itsdangerous.TimestampSigner(secret_key)
         # One connection pool per owner socket, kept for the life of this worker and closed at its shutdown.
         self.clients = clients
+        # Updated in place when a checkpoint restore moves an old worker's sessions to this server's workers.
+        self.aliases = aliases if aliases is not None else {}
+        # Likewise for restored sessions whose cookie or token names no owner, by session ID.
+        self.placements = placements if placements is not None else {}
         self.mcp_token_header = mcp_token_header
         self.mcp_token_serializer = mcp_token_serializer
         self.mcp_path = mcp_path
@@ -363,6 +407,7 @@ class SessionRoutingMiddleware:
         # Forwarded requests are always handled here, so a request is forwarded at most once.
         forwarded = bool(scope.get(_FORWARDED_SCOPE_KEY))
         owner = None if forwarded else self._owner(HTTPConnection(scope))
+        owner = self.aliases.get(owner, owner)
         if owner is not None and owner != self.routing_id:
             await self._forward(owner, scope, receive, send)
             return
@@ -445,10 +490,19 @@ class SessionRoutingMiddleware:
         is_mcp = path == self.mcp_path or path.startswith(self.mcp_path + "/")
         # MCP tool calls name their session by the token, never by a cookie.
         if token is not None and (is_mcp or cookie is None):
-            return mcp_token_owner(token, serializer=self.mcp_token_serializer)
-        if cookie is not None:
-            return session_owner(cookie, signer=self.signer)
-        return None
+            claims, session_id_claim = (
+                _token_claims(token, serializer=self.mcp_token_serializer),
+                _MCP_SESSION_ID_CLAIM,
+            )
+        elif cookie is not None:
+            claims, session_id_claim = _cookie_claims(cookie, signer=self.signer), SESSION_ID_CLAIM
+        else:
+            return _valid_routing_id(connection.headers.get(SESSION_OWNER_HEADER))
+        owner = _valid_owner(claims)
+        if owner is None and self.placements and isinstance(claims, dict):
+            session_id = claims.get(session_id_claim)
+            owner = self.placements.get(session_id) if isinstance(session_id, str) else None
+        return owner
 
     def _client(self, owner: str) -> ClientSession:
         client = self.clients.get(owner)
@@ -665,6 +719,8 @@ def install_session_routing(
         session_cookie=session_cookie,
         secret_key=secret_key,
         clients=clients,
+        aliases=session_aliases(app),
+        placements=session_placements(app),
         mcp_token_header=mcp_token_header,
         mcp_token_serializer=mcp_token_serializer,
         session_claims=claims,

@@ -25,6 +25,7 @@ import warnings
 from abc import abstractmethod
 from asyncio.exceptions import CancelledError
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from functools import partial
 from importlib import import_module
 from importlib.util import find_spec
@@ -89,6 +90,7 @@ from nemo_gym.global_config import (
 from nemo_gym.profiling import Profiler
 from nemo_gym.rollout_correlation import ROUTED_PATH_STATE_KEY, current_rollout_id, maybe_rollout_id_from_run_body
 from nemo_gym.session_routing import (
+    SESSION_ID_CLAIM,
     SESSION_OWNER_KEY,
     SESSION_SOCKET_DIR_ENV,
     create_session_socket_dir,
@@ -1060,7 +1062,24 @@ def _has_injected_global_config_env() -> bool:
     return getenv(NEMO_GYM_CONFIG_DICT_ENV_VAR_NAME) is not None
 
 
-SESSION_ID_KEY = "session_id"
+# Defined with session routing, which reads it from cookies before the session middleware runs.
+SESSION_ID_KEY = SESSION_ID_CLAIM
+# The session ID of the request being served, for code that has no request at hand.
+_CURRENT_SESSION_ID: ContextVar[Optional[str]] = ContextVar("nemo_gym_session_id", default=None)
+
+
+def current_session_id() -> Optional[str]:
+    """The cookie session ID of the request being served, or None outside a request."""
+    return _CURRENT_SESSION_ID.get()
+
+
+# The worker the session cookie of the request being served names, with several workers.
+_CURRENT_SESSION_OWNER: ContextVar[Optional[str]] = ContextVar("nemo_gym_session_owner", default=None)
+
+
+def current_session_owner() -> Optional[str]:
+    """The worker the session cookie of the request being served names, or None without session routing."""
+    return _CURRENT_SESSION_OWNER.get()
 
 
 class BaseServer(BaseModel):
@@ -1536,10 +1555,13 @@ class SimpleServer(BaseServer):
         async def add_session_id(request: Request, call_next):  # pragma: no cover
             # Always assign so Starlette 1.0+ marks session.modified=True and re-sends Set-Cookie.
             request.session[SESSION_ID_KEY] = request.session.get(SESSION_ID_KEY, str(uuid4()))
+            _CURRENT_SESSION_ID.set(request.session[SESSION_ID_KEY])
             # With several workers, a session belongs to the worker that created it (see nemo_gym.session_routing).
             owner = getattr(request.app.state, "nemo_gym_routing_id", None)
             if owner is not None:
                 request.session.setdefault(SESSION_OWNER_KEY, owner)
+            # A cookie from before a restore names a worker the router aliases to this one, and keeps naming it.
+            _CURRENT_SESSION_OWNER.set(request.session.get(SESSION_OWNER_KEY))
 
             response: Response = await call_next(request)
             return response

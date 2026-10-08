@@ -40,6 +40,7 @@ from typing import Any, Literal, Optional, Protocol
 from pydantic import JsonValue
 
 from nemo_gym._checkpoint.control import (
+    PARSED_JSON_CONTEXT,
     CheckpointParticipant,
     CheckpointRecord,
     CheckpointRequest,
@@ -51,6 +52,8 @@ from nemo_gym._checkpoint.errors import AdmissionClosedError, ControlError, Roll
 from nemo_gym._checkpoint.steps import Boundary, EpisodeSteps, StepMode
 from nemo_gym.episode_types import EpisodeId
 from nemo_gym.rollout_correlation import RolloutContextMiddleware, maybe_rollout_id_from_run_body
+from nemo_gym.server_utils import current_session_id, current_session_owner
+from nemo_gym.session_routing import SessionClaims
 
 
 BoundarySnapshot = Callable[[], dict[str, JsonValue]]
@@ -64,6 +67,10 @@ class AgentSessionRecord(CheckpointRecord):
     boundary: Optional[JsonPayload] = None
     # A legacy /run episode's own boundary (which protocol step is next); None for native sessions.
     episode: Optional[JsonPayload] = None
+    # With several workers, the worker ID in the session's cookie (see nemo_gym.session_routing).
+    owner: Optional[str] = None
+    # The session ID in the session's cookie, which routes a restored session whose cookie names no worker.
+    session_id: Optional[str] = None
 
 
 class ActivationOutOfOrderError(ControlError):
@@ -131,6 +138,8 @@ class AgentSessionHooks(Protocol):
 class _Session:
     key: str
     episode_id: EpisodeId
+    owner: Optional[str] = None
+    session_id: Optional[str] = None
     state: Literal["idle", "running", "at_boundary"] = "idle"
     park_requested: bool = False
     boundary: Optional[BoundarySnapshot] = None
@@ -196,6 +205,37 @@ class AgentSessionParticipant(CheckpointParticipant):
         self._restart_calls = _RestartCalls(self.notify)
         self._open = asyncio.Event()
         self._open.set()
+        # With several workers: this worker's routing owner, and where restored legacy episodes are claimed.
+        self.owner: Optional[str] = None
+        # With several workers, which worker each agent_session_id belongs to (see nemo_gym.session_routing).
+        # A restore claims the sessions it installs here, so seeds and closes without a cookie reach them.
+        self.session_claims: Optional[SessionClaims] = None
+        # The claim leases the record to this worker until the block it opens ends; a failure gives it back.
+        self.claim_restored: Optional[Callable[[str], AbstractAsyncContextManager[Optional[dict[str, Any]]]]] = None
+
+    @staticmethod
+    def claim_key(record: CheckpointRecord) -> Optional[str]:
+        # A legacy /run episode lives inside its /run; a native session spans requests.
+        return record.session_key if record.episode is not None else None
+
+    @staticmethod
+    def record_identity(record: CheckpointRecord) -> Optional[str]:
+        # The agent session ID, or an agent's own /run episode's key.
+        # Several sessions can share one cookie, such as two /run episodes sent with one cookie jar.
+        return record.session_key
+
+    def unclaimed_sessions(self) -> list[str]:
+        """Restored sessions no activation or request has used yet, by session key."""
+        return sorted(key for key, session in self._sessions.items() if session.restored_pending)
+
+    async def delete_unclaimed_session(self, identity: str) -> None:
+        """Free a restored session no request has used, without refusing anything later."""
+        session = self._sessions.get(identity)
+        if session is None or not session.restored_pending:
+            return
+        await self.hooks.retire_agent_session(session.key)
+        self._remove(session)
+        self._restored_episodes.pop(session.key, None)
 
     # -- sessions and activations ---------------------------------------------------------------
 
@@ -258,7 +298,10 @@ class AgentSessionParticipant(CheckpointParticipant):
             return
         if not self.accepting and not (seed and session_key in self._seeding):
             raise AdmissionClosedError("agent admission is closed for a checkpoint")
-        self._add(_Session(key=session_key, episode_id=episode_id))
+        # The owner the session's cookie names, which a restore aliases, as for a resources session.
+        # It is this worker unless the cookie was issued before a restore and names a worker this one replaced.
+        owner = current_session_owner() or self.owner
+        self._add(_Session(key=session_key, episode_id=episode_id, owner=owner, session_id=current_session_id()))
 
     def has_session(self, session_key: str) -> bool:
         return session_key in self._sessions
@@ -306,6 +349,7 @@ class AgentSessionParticipant(CheckpointParticipant):
     @asynccontextmanager
     async def legacy_run(self, session_key: str, episode_id: EpisodeId) -> AsyncIterator[LegacyRun]:
         """Hold one legacy ``/run`` episode and its turn-loop session."""
+        await self._claim(session_key, episode_id)
         self.open_session(session_key, episode_id)
         session = self._sessions[session_key]
         # This /run claims a restored episode whatever step it continues at, so a commit no longer retires it.
@@ -316,6 +360,33 @@ class AgentSessionParticipant(CheckpointParticipant):
         finally:
             self._remove(session)
             await self.legacy_episodes.end(session_key)
+
+    async def _claim(self, session_key: str, episode_id: EpisodeId) -> None:
+        """Take a restored legacy episode from the coordinator, if there is one, and install it here."""
+        if self.claim_restored is None or session_key in self._sessions:
+            return
+        self.retired.check(episode_id)
+        async with self.claim_restored(session_key) as claimed:
+            if claimed is None:
+                return
+            # Read back from storage and parsed from the coordinator's reply: its payloads are JSON.
+            record = AgentSessionRecord.model_validate(claimed, context=PARSED_JSON_CONTEXT)
+            restored = RestoredAgentSession(
+                session_key=session_key, episode_id=next_attempt(record.episode_id), session=record.session
+            )
+            # Registered before the agent's hook runs; until the claim is settled, prepare waits for it.
+            session = _Session(
+                key=session_key, episode_id=restored.episode_id, owner=record.owner, continuation=record.boundary
+            )
+            self._add(session)
+            self._restored_episodes[session_key] = record.episode
+            try:
+                await self.hooks.restore_agent_sessions([restored])
+            except BaseException:
+                # The record goes back to the coordinator, to be claimed again.
+                self._remove(session)
+                self._restored_episodes.pop(session_key, None)
+                raise
 
     def check_session(self, session_key: str, episode_id: EpisodeId) -> None:
         """Refuse a request of ``episode_id`` for a session that is not open or belongs to another attempt.
@@ -582,6 +653,8 @@ class AgentSessionParticipant(CheckpointParticipant):
                 boundary=boundary,
                 # A restored legacy episode whose replacement /run has not started keeps its restored step.
                 episode=legacy.get(session.key, self._restored_episodes.get(session.key)),
+                owner=session.owner,
+                session_id=session.session_id,
             )
             for session, boundary in zip(sessions, boundaries)
         ]
@@ -605,18 +678,41 @@ class AgentSessionParticipant(CheckpointParticipant):
             )
             for record in records
         ]
-        await self.hooks.restore_agent_sessions(restored)
+        claimed = self._claim_sessions([session.session_key for session in restored])
+        try:
+            await self.hooks.restore_agent_sessions(restored)
+        except BaseException:
+            # Released unless the agent kept a record of the session.
+            for key in claimed:
+                self.session_claims.release(key)
+            raise
         for record, session in zip(records, restored):
             self._add(
                 _Session(
                     key=session.session_key,
                     episode_id=session.episode_id,
+                    owner=record.owner,
+                    session_id=record.session_id,
                     continuation=record.boundary,
                     restored_pending=True,
                 )
             )
             if record.episode is not None:
                 self._restored_episodes[session.session_key] = record.episode
+
+    def _claim_sessions(self, keys: list[str]) -> list[str]:
+        """Claim each restored agent session for this worker, or claim none if another worker holds one."""
+        if self.session_claims is None:
+            return []
+        claimed: list[str] = []
+        for key in keys:
+            claimant = self.session_claims.claim(key)
+            if claimant != self.session_claims.routing_id:
+                for done in claimed:
+                    self.session_claims.release(done)
+                raise ControlError(f"agent session {key!r} is already held by another worker of this server")
+            claimed.append(key)
+        return claimed
 
     def restore_records(self, records: list[CheckpointRecord]) -> None:
         raise NotImplementedError("agent sessions restore through install(), which awaits the agent's hooks")
@@ -747,6 +843,13 @@ class RestartOnlyAgentParticipant(CheckpointParticipant):
     def restore_records(self, records: list[CheckpointRecord]) -> None:
         if records:
             raise ControlError("a restart-only agent cannot restore rollouts")
+
+    def unclaimed_sessions(self) -> list[str]:
+        # Nothing of a restart-only agent is ever restored.
+        return []
+
+    async def delete_unclaimed_session(self, identity: str) -> None:
+        pass
 
 
 class _RestartCalls:

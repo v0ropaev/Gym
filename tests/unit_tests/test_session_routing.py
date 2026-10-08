@@ -60,11 +60,14 @@ from nemo_gym.session_routing import (
     AGENT_SESSION_CLAIMS_DIR,
     AGENT_SESSION_ROUTES,
     RESOURCES_SESSION_CLAIMS_DIR,
+    SESSION_OWNER_HEADER,
     SESSION_OWNER_KEY,
     SessionClaims,
     SessionRoutingMiddleware,
     install_session_routing,
     serve_private_socket,
+    session_aliases,
+    session_placements,
     worker_socket_path,
 )
 
@@ -207,6 +210,29 @@ class TestSessionRouting:
 
         assert response.json() == {"worker": "a", "query": "x=1&y=a%20b", "probe": "p"}
 
+    def test_a_request_without_a_session_goes_to_the_worker_its_header_names(self, workers) -> None:
+        a, b = workers
+
+        response = b.client.get("/echo", headers={SESSION_OWNER_HEADER: a.routing_id})
+        b.client.cookies.clear()
+        own = b.client.get("/echo")
+
+        assert response.json()["worker"] == "a"
+        assert own.json()["worker"] == "b"
+
+    def test_a_session_of_an_aliased_worker_goes_to_the_worker_that_holds_it_now(self, socket_dir: str) -> None:
+        old, a, b = Worker("old", socket_dir), Worker("a", socket_dir), Worker("b", socket_dir)
+        with old.client:
+            cookie = old.client.post("/store", json={"value": 7}).cookies[old.cookie_name]
+        # A restore moved the exited worker's session to a, and every worker's router knows it.
+        a.server.store.update(old.server.store)
+        for worker in (a, b):
+            session_aliases(worker.app)[old.routing_id] = a.routing_id
+        with a.client, b.client:
+            response = b.client.post("/take", cookies={old.cookie_name: cookie})
+
+        assert response.json() == {"worker": "a", "value": 7}
+
     def test_a_forwarded_request_is_never_forwarded_again(self, workers) -> None:
         a, b = workers
         cookie = a.client.post("/store", json={"value": 7}).cookies[a.cookie_name]
@@ -305,6 +331,28 @@ class TestMCPSessionRouting:
 
         assert result["isError"] is True and "Invalid Gym MCP session token" in result["content"][0]["text"]
         assert a.server.store == {} and b.server.store == {}
+
+    def test_a_restored_session_without_an_owner_is_found_by_its_session_id(self, socket_dir: str) -> None:
+        """A single-worker cookie or MCP token names no worker; a restore places its session by session ID."""
+        single = Worker("single", socket_dir=None, mcp=True)
+        with single.client:
+            seeded = single.client.post("/seed_session", json={})
+            token = seeded.json()["mcp"]["headers"][TOKEN_HEADER]
+            cookie = seeded.cookies[single.cookie_name]
+        session_id = single.session(cookie)[SESSION_ID_KEY]
+        a, b = Worker("a", socket_dir, mcp=True), Worker("b", socket_dir, mcp=True)
+        # A restore installed the session on a, and every worker's router knows where it is.
+        a.server.store[session_id] = 7
+        for worker in (a, b):
+            session_placements(worker.app)[session_id] = a.routing_id
+        with a.client, b.client:
+            by_token = _mcp_payload(_mcp_call(b.client, "take", {}, token))
+            a.server.store[session_id] = 8
+            b.client.cookies.clear()
+            by_cookie = b.client.post("/take", cookies={single.cookie_name: cookie}).json()
+
+        assert by_token == {"worker": "a", "value": 7}
+        assert by_cookie == {"worker": "a", "value": 8}
 
     def test_a_single_worker_mcp_token_has_no_owner(self) -> None:
         single = Worker("single", socket_dir=None, mcp=True)

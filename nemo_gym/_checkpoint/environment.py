@@ -14,12 +14,13 @@ a retire of one that already ran would wait for its cleanup, whose calls wait fo
 import asyncio
 import hashlib
 import json
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Callable
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import Any, Optional
 
 from nemo_gym._checkpoint.control import (
     MAX_REPORTED_BLOCKERS,
+    PARSED_JSON_CONTEXT,
     CheckpointParticipant,
     CheckpointRecord,
     CheckpointRequest,
@@ -55,6 +56,25 @@ class EnvironmentParticipant(CheckpointParticipant):
         self._restored: dict[str, EpisodeRecord] = {}
         # Set by a restore and cleared by the resume after it.
         self._awaiting_resume = False
+        # With several workers, restored boundaries stay with the coordinator until a replacement claims one.
+        # The claim leases the record to this worker until the block it opens ends; a failure gives it back.
+        self.claim_restored: Optional[Callable[[str], AbstractAsyncContextManager[Optional[dict[str, Any]]]]] = None
+
+    @staticmethod
+    def claim_key(record: CheckpointRecord) -> Optional[str]:
+        return next_attempt(record.episode_id).capture_key
+
+    async def claim(self, episode_id: EpisodeId) -> None:
+        """Take this attempt's restored boundary from the coordinator, if there is one; call before ``begin``."""
+        if self.claim_restored is None:
+            return
+        self.retired.check(episode_id)
+        async with self.claim_restored(episode_id.capture_key) as record:
+            if record is not None:
+                # Read back from storage and parsed from the coordinator's reply: its payloads are JSON.
+                self._restored[episode_id.capture_key] = EpisodeRecord.model_validate(
+                    record, context=PARSED_JSON_CONTEXT
+                )
 
     def begin(
         self, episode_id: EpisodeId, task: Any, deadline: Optional[asyncio.Timeout], *, restart: bool = False
@@ -169,6 +189,13 @@ class EnvironmentParticipant(CheckpointParticipant):
 
     def status_extra(self) -> dict[str, Any]:
         return {"restored_pending": sorted(self._restored)}
+
+    def unclaimed_sessions(self) -> list[str]:
+        # A restored episode stays with the coordinator until a replacement claims it, so no copy is left here.
+        return []
+
+    async def delete_unclaimed_session(self, identity: str) -> None:
+        pass
 
 
 def _covers(retired: EpisodeId, capture_key: str) -> bool:
