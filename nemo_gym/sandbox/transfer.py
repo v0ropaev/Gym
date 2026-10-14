@@ -8,7 +8,8 @@ Files move between this host and a sandbox as tar archives: :func:`upload_dir` a
 :func:`exec_as_root`, so the task's file modes travel unchanged and a target the image's default
 user cannot write (``/tests``, ``/logs``) is still reachable. :func:`upload_path` and
 :func:`download_path` move a single file or a directory the same way, and :func:`remote_kind` tells
-which a path is. :class:`SandboxTransferError` reports a transfer command that failed inside the
+which a path is. :func:`tar_extract_command` is the shell line that unpacks an uploaded archive with
+GNU or BusyBox tar. :class:`SandboxTransferError` reports a transfer command that failed inside the
 sandbox, :class:`SandboxProbeError` a probe the sandbox could not answer, and
 :class:`SandboxUnavailableError` a command the provider could not run at all, which is Gym's outage
 rather than the task's. Environment servers and the agents that seed a sandbox share this module.
@@ -130,10 +131,22 @@ async def exec_as_root(sandbox: AsyncSandbox, command: str, *, timeout_s: float)
     return result
 
 
-async def upload_dir(sandbox: AsyncSandbox, source: Path, target: str, *, timeout_s: float = 600) -> None:
+def tar_extract_command(remote: str, target: str) -> str:
+    """The shell line that unpacks the uploaded archive ``remote`` into ``target`` with GNU or BusyBox tar."""
+    quoted = shlex.quote(target)
+    return (
+        "opts=''; tar --no-overwrite-dir --help >/dev/null 2>&1 && opts=--no-overwrite-dir; "
+        f"mkdir -p {quoted} && tar -xzf {remote} --no-same-owner $opts -C {quoted}"
+    )
+
+
+async def upload_dir(
+    sandbox: AsyncSandbox, source: Path, target: str, *, timeout_s: float = 600, make_readable: bool = False
+) -> None:
     """Copy the contents of ``source`` into ``target`` inside the sandbox.
 
-    File modes travel with the archive; the target directory keeps its own mode and ownership.
+    File modes travel with the archive. ``make_readable`` additionally opens the tree to every user, for a
+    solution the task user must read; a verifier tree keeps its modes because tests may check them.
     """
     remote = f"/tmp/.nemo-gym-upload-{uuid4().hex}.tar.gz"
     with tempfile.TemporaryDirectory() as tmp:
@@ -142,11 +155,15 @@ async def upload_dir(sandbox: AsyncSandbox, source: Path, target: str, *, timeou
         await asyncio.to_thread(_pack, source, archive)
         await sandbox.upload(archive, remote)
     # --no-overwrite-dir keeps the target folder's own ownership and mode: it may be a root-owned
-    # world-writable folder the extracting user cannot chmod.
+    # world-writable folder the extracting user cannot chmod. GNU tar has the option; BusyBox tar
+    # (Alpine images) rejects options it does not know, so it is passed only where `tar --help`
+    # accepts it. `_pack` leaves the `.` entry out of the archive, so without the option only an
+    # explicit entry could touch the target's own metadata. The readability fix-up is best effort
+    # for the same reason.
+    fixup = f"chmod -R a+rX {shlex.quote(target)} 2>/dev/null || true; " if make_readable else ""
     result = await exec_as_root(
         sandbox,
-        f"mkdir -p {shlex.quote(target)} && tar -xzf {remote} --no-same-owner --no-overwrite-dir -C {shlex.quote(target)}; "
-        f"status=$?; rm -f {remote}; exit $status",
+        f"{tar_extract_command(remote, target)}; status=$?; {fixup}rm -f {remote}; exit $status",
         timeout_s=timeout_s,
     )
     if result.return_code:
