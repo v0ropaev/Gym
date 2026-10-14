@@ -668,6 +668,28 @@ class TestAgentStage:
             "/v1/agent_sessions/close",
         ]
 
+    @pytest.mark.parametrize("declaration", sorted(TASK_TOOL_CONTEXT_DECLARATIONS))
+    async def test_the_oracle_declares_support_so_dataset_validate_runs_the_task(
+        self, tmp_path, monkeypatch, declaration
+    ):
+        """`gym dataset validate` runs the oracle through this server; solve.sh reaches the task's tools by itself."""
+        from unittest.mock import MagicMock
+
+        from responses_api_agents.oracle_agent.app import OracleAgent, OracleAgentConfig
+
+        oracle = OracleAgent(
+            config=OracleAgentConfig(host="0.0.0.0", port=8081, entrypoint="", name="oracle_agent"),
+            server_client=MagicMock(spec=ServerClient),
+        )
+        server, task, sandbox, _ = make_server(tmp_path, monkeypatch, toml=task_tool_context_toml(declaration))
+        server.server_client.supports_task_tool_context = oracle.supports_task_tool_context()
+
+        response = await run_episode(server, task)
+
+        assert response.failure is None, response.failure
+        assert response.result.reward == 1.0
+        assert any("test.sh" in call["command"] for call in sandbox.execs)
+
     async def test_a_task_without_tool_declarations_runs_on_any_harness(self, tmp_path, monkeypatch):
         server, task, _, _ = make_server(tmp_path, monkeypatch)
         server.server_client.supports_task_tool_context = False
@@ -1105,7 +1127,7 @@ class AgentSandbox(FakeSandbox):
         result = (await run_episode(server, task)).result
         # The outage is Gym's, not an empty artifact: masked, and no verifier was started for it.
         assert result.mask_sample is True and result.failure_kind == "provider_unavailable"
-        assert "Could not probe /logs/artifacts: sandbox" in result.failure_reason
+        assert "SandboxUnavailableError" in result.failure_reason and "container gone" in result.failure_reason
         assert created == [] and verifier.execs == [] and agent.stopped
 
         server, task, agent, verifier, _ = self.prepared(tmp_path, monkeypatch)
@@ -1210,7 +1232,13 @@ class TestSeparateVerification:
             == "mkdir -p /logs/artifacts && find /logs/artifacts -mindepth 1 -delete && chmod 777 /logs/artifacts"
             for c in verifier.execs
         )
-        assert any(c["command"] == "mkdir -p /app/output && chmod 777 /app/output" for c in verifier.execs)
+        # A file's parent is created world-writable when missing and widened when it exists; when the chmod is
+        # refused (an image that cannot switch to root) the parent only has to be writable.
+        prepare = (
+            "if [ -d /app/output ]; then chmod a+rwx /app/output 2>/dev/null || test -w /app/output; "
+            "else mkdir -p /app/output && chmod 777 /app/output; fi"
+        )
+        assert any(c["command"] == prepare for c in verifier.execs)
         run = next(c for c in verifier.execs if "test.sh" in c["command"] and "timeout" in c["command"])
         assert run["command"] == f"chmod +x /tests/test.sh; {verifier_command(300)}"
         assert (run["env"], run["user"], run["cwd"]) == ({"CHECK": "strict"}, "root", None)
