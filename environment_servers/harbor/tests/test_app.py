@@ -177,6 +177,8 @@ class FakeAgentClient(ServerClient):
     fail_with: dict = {}
     slow_path: str | None = None
     observations: dict | None = None
+    # What the seed response declares: a harness that reads the task's MCP servers and skills directory.
+    supports_task_tool_context: bool = True
     turn_response: dict | None = None
     # Called when the harness takes its turn, between the seed and the verification of an episode.
     turn_hooks: list = []
@@ -198,7 +200,12 @@ class FakeAgentClient(ServerClient):
             raise self.fail_with.pop(url_path)
         if url_path == "/v1/agent_sessions":
             AgentSeedSessionRequest.model_validate(body)
-            return _Response({"agent_session_id": body["agent_session_id"]})
+            return _Response(
+                {
+                    "agent_session_id": body["agent_session_id"],
+                    "supports_task_tool_context": self.supports_task_tool_context,
+                }
+            )
         if url_path == "/v1/agent_sessions/close":
             return _Response({"agent_session_id": body["agent_session_id"], "agent_observations": self.observations})
         if url_path.endswith("/v1/responses"):
@@ -611,7 +618,63 @@ class TestSeedWorkdirAndResources:
         assert "OMP_NUM_THREADS" not in server._sandbox_spec(task, "/app").env
 
 
+TASK_TOOL_CONTEXT_DECLARATIONS = {
+    "mcp_servers": '[[environment.mcp_servers]]\nname = "playwright"\ntransport = "sse"\nurl = "http://api:3080/sse"\n',
+    "skills_dir": 'skills_dir = "/app/.skills"\n',
+}
+
+
+def task_tool_context_toml(declaration: str) -> str:
+    """TASK_TOML whose ``[environment]`` table also carries the given tool declaration."""
+    return TASK_TOML + TASK_TOOL_CONTEXT_DECLARATIONS[declaration]
+
+
 class TestAgentStage:
+    @pytest.mark.parametrize("declaration", sorted(TASK_TOOL_CONTEXT_DECLARATIONS))
+    async def test_task_tool_context_is_refused_to_a_harness_that_did_not_declare_support(
+        self, tmp_path, monkeypatch, declaration
+    ):
+        """Terminus 2 never sees the task's MCP servers or skills: the run would score a silent zero."""
+        server, task, sandbox, _ = make_server(tmp_path, monkeypatch, toml=task_tool_context_toml(declaration))
+        server.server_client.supports_task_tool_context = False
+
+        response = await run_episode(server, task)
+
+        failure = response.failure
+        assert response.result is None and failure.stage == "agent" and failure.terminal
+        assert "declares MCP servers or a skills directory" in failure.failure_reason
+        assert "'agent' does not support" in failure.failure_reason
+        assert "supports_task_tool_context" in failure.failure_reason
+        # The harness was seeded and is closed again, but never took its turn, and nothing was verified.
+        assert server.server_client.paths() == ["/v1/agent_sessions", "/v1/agent_sessions/close"]
+        assert not any("test.sh" in call["command"] for call in sandbox.execs)
+        assert sandbox.stopped and not server._sandboxes
+
+    @pytest.mark.parametrize("declaration", sorted(TASK_TOOL_CONTEXT_DECLARATIONS))
+    async def test_task_tool_context_runs_on_a_harness_that_declared_support(self, tmp_path, monkeypatch, declaration):
+        """mini-SWE reads the task's MCP servers and skills from the sandbox, so the task is run and verified."""
+        server, task, sandbox, _ = make_server(tmp_path, monkeypatch, toml=task_tool_context_toml(declaration))
+        assert server.server_client.supports_task_tool_context is True
+
+        response = await run_episode(server, task)
+
+        assert response.failure is None, response.failure
+        assert response.result.reward == 1.0
+        assert server.server_client.paths() == [
+            "/v1/agent_sessions",
+            "/ng-rollout/r1/v1/responses",
+            "/v1/agent_sessions/close",
+        ]
+
+    async def test_a_task_without_tool_declarations_runs_on_any_harness(self, tmp_path, monkeypatch):
+        server, task, _, _ = make_server(tmp_path, monkeypatch)
+        server.server_client.supports_task_tool_context = False
+
+        response = await run_episode(server, task)
+
+        assert response.failure is None, response.failure
+        assert response.result.reward == 1.0
+
     async def test_lost_agent_seed_is_a_retryable_agent_failure_and_stops_the_sandbox(self, tmp_path, monkeypatch):
         server, task, sandbox, _ = make_server(tmp_path, monkeypatch)
         server.server_client.fail_path = "/v1/agent_sessions"

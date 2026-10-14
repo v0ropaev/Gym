@@ -588,6 +588,20 @@ class HarborEnvironmentServer(
             if agent_session.agent_session_id != agent_session_id:
                 raise ValueError("Agent seed returned a different agent_session_id")
             agent_cookies = _cookies(agent_create_http_response)
+            environment = session.task.config.environment
+            if (environment.mcp_servers or environment.skills_dir) and not agent_session.supports_task_tool_context:
+                # The task's tools would never reach this harness, and the run would score a silent zero.
+                raise HTTPException(
+                    422,
+                    f"Task {session.task.task_id!r} declares MCP servers or a skills directory, which the agent "
+                    f"{self.config.agent_server.name!r} does not support; run it with a harness that declares "
+                    "supports_task_tool_context in its seed response",
+                )
+        except HTTPException as error:
+            # The configured harness cannot take this task; a retry would be refused the same way.
+            raise self._failure(
+                stage="agent", failure_reason=str(error.detail), terminal=error.status_code < 500
+            ) from error
         except Exception as error:
             raise self._failure(
                 stage="agent",

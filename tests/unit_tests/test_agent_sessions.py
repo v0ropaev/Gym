@@ -5,11 +5,14 @@ import asyncio
 from unittest.mock import MagicMock
 
 import pytest
+from fastapi import HTTPException
 from pydantic import ValidationError
 
 from nemo_gym.base_responses_api_agent import (
     AgentCloseSessionRequest,
     AgentSeedSessionRequest,
+    AgentSeedSessionResponse,
+    AgentSessionState,
     SimpleResponsesAPIAgent,
 )
 from nemo_gym.episode_types import EpisodeId, TaskId
@@ -70,6 +73,15 @@ def test_episode_tool_access_overrides_configured_access_by_name() -> None:
     assert agent.effective_tool_accesses(_seed_request(tool_accesses=[episode])) == [episode]
 
 
+def test_seed_with_several_workers_is_a_client_fault_not_a_server_error() -> None:
+    # Session state is process-local. A 422 makes the environment server record the seed as a terminal
+    # failure; a 500 would be retried on every episode of the run.
+    agent = _Agent.model_construct(config=MagicMock(num_workers=4), server_client=MagicMock())
+    with pytest.raises(HTTPException) as excinfo:
+        asyncio.run(agent.seed_agent_session(MagicMock(), _seed_request()))
+    assert excinfo.value.status_code == 422 and "num_workers=1" in excinfo.value.detail
+
+
 def test_base_agent_exposes_unimplemented_session_routes() -> None:
     agent = _Agent.model_construct(config=MagicMock(num_workers=1), server_client=MagicMock())
     request = MagicMock()
@@ -89,3 +101,24 @@ def test_base_agent_exposes_unimplemented_session_routes() -> None:
     paths = agent.setup_webserver().openapi()["paths"]
     assert "/v1/agent_sessions" in paths
     assert "/v1/agent_sessions/close" in paths
+
+
+def test_seed_response_carries_the_harness_task_tool_context_declaration() -> None:
+    """The environment server refuses a task with MCP servers or skills to a harness that answers False here."""
+
+    class _Seeded(_Agent):
+        async def _seed_agent_session_state(self, body):
+            return AgentSessionState(request=body)
+
+    class _ReadsTaskTools(_Seeded):
+        def supports_task_tool_context(self) -> bool:
+            return True
+
+    for agent_cls, declared in ((_Seeded, False), (_ReadsTaskTools, True)):
+        agent = agent_cls.model_construct(config=MagicMock(num_workers=1), server_client=MagicMock())
+        response = asyncio.run(agent.seed_agent_session(MagicMock(session={}), _seed_request()))
+        assert response == AgentSeedSessionResponse(
+            agent_session_id="agent-session", supports_task_tool_context=declared
+        )
+    # The field has a default so an older harness's reply still validates, as not supporting it.
+    assert AgentSeedSessionResponse.model_validate({"agent_session_id": "x"}).supports_task_tool_context is False
