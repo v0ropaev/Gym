@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """D5: the sandbox Compose adapter's field check runs at prepare, per task, on the document the sandbox receives,
-and ``pull_policy`` is dropped from every service of that document."""
+and ``pull_policy`` is dropped from every service of that document. With M28 the check is
+``check_task_compose_fields``, whose first step is the key allow-list; a refused key is a skipped task."""
 
 import json
 from pathlib import Path
@@ -10,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from nemo_gym.tasks.harbor import image_configs
-from nemo_gym.tasks.harbor.cli import BuildOptions, prepare_target, unsupported_compose_fields_error
+from nemo_gym.tasks.harbor.cli import BuildOptions, prepare_target
 from nemo_gym.tasks.harbor.digest import context_digest
 from nemo_gym.tasks.harbor.dockerfile import RECORD_VERSION
 from nemo_gym.tasks.harbor.image_build import (
@@ -21,7 +22,10 @@ from nemo_gym.tasks.harbor.image_build import (
     settle_entry,
 )
 from nemo_gym.tasks.harbor.image_configs import (
+    ImageConfigError,
+    check_task_compose_fields,
     load_compose_document,
+    record_compose_images,
     without_pull_policy,
     without_restated_main_build,
 )
@@ -35,6 +39,8 @@ AGENT_IMAGE = "harborframework/harbor-index:cybergym-agent@sha256:" + "a" * 64
 TASK_SERVER_IMAGE = "harborframework/harbor-index:cybergym-task-server@sha256:" + "c" * 64
 
 # The three hub shapes D_TESTS reproduced: featurebench 265e447753be, rh-swe-bench 0884ee3e43b7, harbor-index 9d8c77f891ab.
+# M28 gives ``deploy``, ``extra_hosts`` and ``platform`` their meaning, so only featurebench's ``count: all`` is
+# still refused, in the check's own words; a key no provider starts (``privileged``) is the allow-list's refusal.
 FEATUREBENCH = """services:
   main:
     deploy:
@@ -90,6 +96,7 @@ PULL_POLICIES = """services:
 """
 SIDECAR_CACHE = "services:\n  main:\n    image: ${MAIN_IMAGE_NAME}\n  cache:\n    image: redis:7-alpine\n"
 SIDECAR_BUILD = "services:\n  main:\n    image: ${MAIN_IMAGE_NAME}\n  api:\n    image: org/api:1\n    build: .\n"
+PRIVILEGED = "services:\n  main:\n    privileged: true\n"
 
 
 class StubRegistry:
@@ -161,7 +168,6 @@ def record_built(folder: Path, task: Path, *, architecture: str = "amd64") -> st
     return image
 
 
-REFUSED_NOTE = " (the sandbox Compose adapter does not start them)"
 UNBUILT_NOTE = " cannot be applied in pull or overlay mode (Gym does not build this Dockerfile)"
 GOOD = "services:\n  main:\n    image: ${MAIN_IMAGE_NAME}\n"
 
@@ -190,20 +196,25 @@ class TestWithoutPullPolicy:
         assert without_pull_policy(document) == document
 
 
-class TestUnsupportedComposeFieldsError:
+class TestCheckTaskComposeFields:
     def test_a_task_without_a_compose_file_is_not_a_compose_task(self, tmp_path):
         task = write_task(tmp_path, "plain", compose="")
         (task / "environment" / "docker-compose.yaml").unlink()
         image_configs.record_base_images(tmp_path)
-        assert unsupported_compose_fields_error(load_task(task)) is None
+        assert load_compose_document(load_task(task)) is None
+        assert record_compose_images([load_task(task)], tmp_path) is None
 
     def test_a_sidecar_build_is_still_a_refused_field(self, tmp_path):
         task = write_task(tmp_path, "ctr", compose=SIDECAR_BUILD, dockerfile=BUILD_DOCKERFILE)
         record_built(tmp_path, task)
         image_configs.record_base_images(tmp_path)
         (loaded,) = discover_tasks(tmp_path)
-        error = unsupported_compose_fields_error(loaded)
-        assert str(error) == "docker-compose.yaml: Service 'api': unsupported Compose fields ['build']" + REFUSED_NOTE
+        with pytest.raises(ImageConfigError) as info:
+            check_task_compose_fields(loaded, load_compose_document(loaded))
+        assert (
+            str(info.value)
+            == "ctr: environment/docker-compose.yaml: Service 'api': unsupported Compose fields ['build']"
+        )
 
 
 class TestRestatedMainBuild:
@@ -230,7 +241,7 @@ class TestRestatedMainBuild:
         assert task.built_image is None and bool(task.overlay) == (dockerfile is OVERLAY_DOCKERFILE)
         document, reason = without_restated_main_build(task, load_compose_document(task))
         assert reason is None and document["services"]["main"] == {"image": task.image}
-        assert unsupported_compose_fields_error(task) is None
+        assert "build" not in check_task_compose_fields(task, load_compose_document(task))["services"]["main"]
         prepared = prepare_target(str(folder), output_root=tmp_path / "out", build=BuildOptions(enabled=False))
         assert [t.task_id for t in prepared.tasks] == ["restated"] and prepared.skipped == {}
         assert len(prepared.rows_path.read_text().splitlines()) == 1
@@ -257,7 +268,7 @@ class TestRestatedMainBuild:
         assert "build" in document["services"]["main"]
         prepared = prepare_target(str(folder), output_root=tmp_path / "out", build=BuildOptions(enabled=False))
         assert [t.task_id for t in prepared.tasks] == ["good"]
-        assert prepared.skipped == {"unbuilt": f"docker-compose.yaml: {keys}{UNBUILT_NOTE}"}
+        assert prepared.skipped == {"unbuilt": f"unbuilt: environment/docker-compose.yaml: {keys}{UNBUILT_NOTE}"}
 
     def test_a_built_task_and_a_prebuilt_image_are_left_to_the_other_rules(self, tmp_path):
         built = write_task(tmp_path, "built", compose=PULL_POLICIES, dockerfile=BUILD_DOCKERFILE)
@@ -272,12 +283,20 @@ class TestRestatedMainBuild:
             assert without_restated_main_build(tasks[task_id], document) == (document, None)
         # The loader already put the recorded image in for the built main, its build: and pull_policy gone
         # (with_built_images); the prebuilt task's main keeps its section for the field check to report.
-        assert load_compose_document(tasks["built"])["services"]["main"] == {"image": tasks["built"].built_image}
+        built_document = load_compose_document(tasks["built"])
+        assert built_document["services"]["main"] == {"image": tasks["built"].built_image}
         assert "build" in load_compose_document(tasks["prebuilt"])["services"]["main"]
-        assert unsupported_compose_fields_error(tasks["built"]) is None
+        # The document checked is the one the sandbox receives: the built task's main build section and every
+        # pull_policy are gone from it, so they are not reported.
+        checked = check_task_compose_fields(tasks["built"], built_document)
+        assert "build" not in checked["services"]["main"]
+        assert all("pull_policy" not in service for service in checked["services"].values())
         # The same file on a task that was not built keeps a main build with a target Gym cannot apply.
-        error = unsupported_compose_fields_error(tasks["pulled"])
-        assert str(error) == "docker-compose.yaml: main.build.target" + UNBUILT_NOTE
+        with pytest.raises(ImageConfigError) as info:
+            check_task_compose_fields(tasks["pulled"], load_compose_document(tasks["pulled"]))
+        assert str(info.value) == "pulled: environment/docker-compose.yaml: main.build.target" + UNBUILT_NOTE
+        # The loader's own document is untouched by the check.
+        assert "pull_policy" in load_compose_document(tasks["pulled"])["services"]["api"]
 
 
 class TestPrepareChecksTheFieldsBeforeBuilding:
@@ -293,7 +312,7 @@ class TestPrepareChecksTheFieldsBeforeBuilding:
 
         folder = tmp_path / "ds"
         folder.mkdir()
-        bad = write_task(folder, "featurebench", compose=FEATUREBENCH, dockerfile=BUILD_DOCKERFILE)
+        bad = write_task(folder, "privileged", compose=PRIVILEGED, dockerfile=BUILD_DOCKERFILE)
         fine = write_task(folder, "fine", compose=PULL_POLICIES, dockerfile=BUILD_DOCKERFILE)
         write_task(folder, "good", compose=GOOD)
         tool = FakeTool("docker", fail=str(bad / "environment"))
@@ -310,7 +329,8 @@ class TestPrepareChecksTheFieldsBeforeBuilding:
         assert [task.task_id for task in prepared.tasks] == ["fine", "good"]
         assert len(prepared.rows_path.read_text().splitlines()) == 2
         expected = {
-            "featurebench": "docker-compose.yaml: Service 'main': unsupported Compose fields ['deploy']" + REFUSED_NOTE
+            "privileged": "privileged: environment/docker-compose.yaml: "
+            "Service 'main': unsupported Compose fields ['privileged']"
         }
         assert prepared.skipped == expected
         assert json.loads((tmp_path / "out" / "ds" / "skipped.json").read_text()) == expected
@@ -324,12 +344,13 @@ class TestPrepareChecksTheFieldsBeforeBuilding:
     def test_with_builds_disabled_the_field_is_still_the_reason(self, tmp_path):
         folder = tmp_path / "ds"
         folder.mkdir()
-        write_task(folder, "featurebench", compose=FEATUREBENCH, dockerfile=BUILD_DOCKERFILE)
+        write_task(folder, "privileged", compose=PRIVILEGED, dockerfile=BUILD_DOCKERFILE)
         write_task(folder, "good", compose=GOOD)
         prepared = prepare_target(str(folder), output_root=tmp_path / "out", build=BuildOptions(enabled=False))
         assert [task.task_id for task in prepared.tasks] == ["good"]
         assert prepared.skipped == {
-            "featurebench": "docker-compose.yaml: Service 'main': unsupported Compose fields ['deploy']" + REFUSED_NOTE
+            "privileged": "privileged: environment/docker-compose.yaml: "
+            "Service 'main': unsupported Compose fields ['privileged']"
         }
 
 
@@ -371,34 +392,41 @@ class TestPreparedImages:
 
 
 class TestPrepareReportsRefusedFieldsPerTask:
-    def test_the_three_hub_shapes_are_skipped_at_prepare_naming_the_field(self, tmp_path, caplog):
-        """featurebench and rh-swe-bench carry a stale built-image record: the record does not put a refused task
-        in the rows."""
+    def test_the_hub_shapes_prepare_or_are_skipped_naming_the_field(self, tmp_path, caplog):
+        """M28 gives ``extra_hosts`` (rh-swe-bench) and ``platform`` with ``deploy`` limits (harbor-index) their
+        meaning, so those tasks prepare; featurebench's ``count: all`` and a key no provider starts are each a
+        skipped task with the field named, as an unloadable task is, not a seed failure of every episode.
+        featurebench and privileged carry a stale built-image record: the record does not put a refused task in
+        the rows."""
         folder = tmp_path / "ds"
         folder.mkdir()
         record_built(folder, write_task(folder, "featurebench", compose=FEATUREBENCH, dockerfile=BUILD_DOCKERFILE))
-        record_built(folder, write_task(folder, "rh-swe-bench", compose=RH_SWE_BENCH, dockerfile=BUILD_DOCKERFILE))
+        swe = record_built(
+            folder, write_task(folder, "rh-swe-bench", compose=RH_SWE_BENCH, dockerfile=BUILD_DOCKERFILE)
+        )
         write_task(folder, "harbor-index", compose=HARBOR_INDEX, dockerfile=None, docker_image=AGENT_IMAGE)
+        record_built(folder, write_task(folder, "privileged", compose=PRIVILEGED, dockerfile=BUILD_DOCKERFILE))
         good = record_built(folder, write_task(folder, "good", compose=PULL_POLICIES, dockerfile=BUILD_DOCKERFILE))
 
         prepared = prepare_target(str(folder), output_root=tmp_path / "out", build=BuildOptions(enabled=False))
 
-        assert [task.task_id for task in prepared.tasks] == ["good"]
-        assert prepared.images == ("org/api:1", good)  # the sidecar's image is pre-pulled with the task's
+        assert [task.task_id for task in prepared.tasks] == ["good", "harbor-index", "rh-swe-bench"]
+        # The sidecar images (org/api:1 for good, the task server for harbor-index) are pre-pulled with the tasks'.
+        assert set(prepared.images) == {"org/api:1", good, swe, AGENT_IMAGE, TASK_SERVER_IMAGE}
         skipped = json.loads((tmp_path / "out" / "ds" / "skipped.json").read_text())
         assert skipped == prepared.skipped
-        assert skipped == {
-            "featurebench": "docker-compose.yaml: Service 'main': unsupported Compose fields ['deploy']"
-            + REFUSED_NOTE,
-            "rh-swe-bench": "docker-compose.yaml: Service 'main': unsupported Compose fields ['extra_hosts']"
-            + REFUSED_NOTE,
-            "harbor-index": "docker-compose.yaml: Service 'task-server': unsupported Compose fields "
-            "['deploy', 'platform']" + REFUSED_NOTE,
-        }
+        assert set(skipped) == {"featurebench", "privileged"}
+        assert skipped["featurebench"].startswith(
+            "featurebench: environment/docker-compose.yaml: deploy.resources.reservations.devices"
+        )
+        assert "count: all is not supported" in skipped["featurebench"]
+        assert skipped["privileged"] == (
+            "privileged: environment/docker-compose.yaml: Service 'main': unsupported Compose fields ['privileged']"
+        )
         rows = prepared.rows_path.read_text().splitlines()
-        assert len(rows) == 1 and '"good"' in rows[0]
+        assert len(rows) == 3 and '"good"' in rows[0]
         for task_id in skipped:
-            assert f"Skipping task {task_id}: docker-compose.yaml: Service" in caplog.text
+            assert f"Skipping task {task_id}: {task_id}: environment/docker-compose.yaml: " in caplog.text
         # The images were still recorded, so a fixed task file needs no new registry round-trip.
         recorded = json.loads((folder / "compose-images.json").read_text())
         assert TASK_SERVER_IMAGE in recorded and AGENT_IMAGE in recorded
@@ -406,12 +434,12 @@ class TestPrepareReportsRefusedFieldsPerTask:
     def test_a_dataset_with_no_task_left_fails_after_writing_the_reasons(self, tmp_path):
         folder = tmp_path / "ds"
         folder.mkdir()
-        write_task(folder, "only", compose=RH_SWE_BENCH)
+        write_task(folder, "only", compose=PRIVILEGED)
         with pytest.raises(ValueError, match="No runnable task left"):
             prepare_target(str(folder), output_root=tmp_path / "out", build=BuildOptions(enabled=False))
         skipped = json.loads((tmp_path / "out" / "ds" / "skipped.json").read_text())
         assert skipped == {
-            "only": "docker-compose.yaml: Service 'main': unsupported Compose fields ['extra_hosts']" + REFUSED_NOTE
+            "only": "only: environment/docker-compose.yaml: Service 'main': unsupported Compose fields ['privileged']"
         }
 
     def test_a_refused_field_does_not_hide_a_task_the_selection_left_out(self, tmp_path):
