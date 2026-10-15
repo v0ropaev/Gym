@@ -3316,6 +3316,9 @@ class TestSandboxProviderAtPrepare:
             harbor_cli, "gpu_sandbox_provider_from_overrides", lambda overrides, sandbox: f"g:{sandbox}"
         )
         monkeypatch.setattr(harbor_cli, "compose_platform_from_overrides", lambda overrides: "linux/arm64")
+        # The M22 readers of the same blocks are stubbed too: the sandbox file this test names does not exist.
+        monkeypatch.setattr(harbor_cli, "volume_sources_from_overrides", lambda overrides, sandbox: None)
+        monkeypatch.setattr(harbor_cli, "gpu_volume_sources_from_overrides", lambda overrides, sandbox: None)
         # The rows file is scoped to the agent, so the stub has to name one.
         monkeypatch.setattr(
             harbor_cli, "resolve_agent", lambda name: harbor_cli.AgentSelection(Path("a.yaml"), name, name)

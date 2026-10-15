@@ -90,7 +90,11 @@ from nemo_gym.sandbox.compose_config import (
     sandbox_platform,
     service_gpus,
 )
-from nemo_gym.sandbox.config import resolve_provider_config, resolve_provider_metadata
+from nemo_gym.sandbox.config import (
+    resolve_provider_config,
+    resolve_provider_metadata,
+    resolve_provider_volume_sources,
+)
 from nemo_gym.sandbox.providers.base import ORPHAN_REAP_TIMEOUT_S, SandboxCreateError
 from nemo_gym.sandbox.transfer import (
     SandboxProbeError,
@@ -110,6 +114,7 @@ from nemo_gym.tasks.harbor.dockerfile import DEFAULT_SHELL, OverlayRun
 from nemo_gym.tasks.harbor.image_configs import (
     check_task_compose_fields,
     load_compose_document,
+    plan_task_compose_volumes,
     task_declares_gpus,
     without_pull_policy,
     without_restated_main_build,
@@ -1262,6 +1267,10 @@ class HarborEnvironmentServer(
             )
         return json.loads(path.read_text())
 
+    def _volume_sources(self, task: HarborTask) -> dict[str, str]:
+        """The provider block's ``volume_sources``: external volumes and foreign bind sources on shared storage."""
+        return resolve_provider_volume_sources(self._provider_ref(task), get_global_config_dict())
+
     def _compose_document(self, task: HarborTask) -> dict[str, Any]:
         """The published overlay resolved against recorded image metadata, ready for the Compose adapter."""
         image_configs = self._compose_image_configs(task)
@@ -1298,6 +1307,9 @@ class HarborEnvironmentServer(
             gpu_provider=_provider_name(gpu_provider),
             platform=self._compose_platform(),
         )
+        # The same planner prepare used: task-file bind mounts become uploads, named volumes stay for shared
+        # storage, external ones resolve through the provider block. Sources point into the server's task copy.
+        plan_task_compose_volumes(task, document, volume_sources=self._volume_sources(task))
         # Every service of the group, GPU-routed or not, starts with the one configured set of provider options,
         # so the platform they request (OpenSandbox ``platform: {os, arch}``; linux/amd64 when unset) is the one
         # each recorded image has to be for (and the one `_compose_platform` spelled for the field check above).
@@ -1435,6 +1447,9 @@ class HarborEnvironmentServer(
                 timeout_s=self.config.sandbox_ready_timeout_s,
                 service_providers=service_providers,
                 platform=platform,
+                volume_sources=self._volume_sources(task),
+                # Upload sources may only come from the server's own copy of the task, the one the planner saw.
+                upload_root=task.path,
             ),
             start=lambda compose: compose.start(),
         )
