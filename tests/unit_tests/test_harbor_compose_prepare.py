@@ -148,7 +148,7 @@ def record_built(folder: Path, task: Path, *, architecture: str = "amd64") -> st
         "config": {},
         "record_version": RECORD_VERSION,
     }
-    (entry,) = plan_builds(task)
+    entry = next(entry for entry in plan_builds(task) if entry.is_main)
     try:
         # The digest a build of the context records, so prepare reuses this record rather than rebuilding it.
         configs[image]["inputs_digest"] = build_inputs_digest(
@@ -270,7 +270,10 @@ class TestRestatedMainBuild:
         for task_id in ("built", "prebuilt"):
             document = load_compose_document(tasks[task_id])
             assert without_restated_main_build(tasks[task_id], document) == (document, None)
-            assert "build" in document["services"]["main"]
+        # The loader already put the recorded image in for the built main, its build: and pull_policy gone
+        # (with_built_images); the prebuilt task's main keeps its section for the field check to report.
+        assert load_compose_document(tasks["built"])["services"]["main"] == {"image": tasks["built"].built_image}
+        assert "build" in load_compose_document(tasks["prebuilt"])["services"]["main"]
         assert unsupported_compose_fields_error(tasks["built"]) is None
         # The same file on a task that was not built keeps a main build with a target Gym cannot apply.
         error = unsupported_compose_fields_error(tasks["pulled"])
