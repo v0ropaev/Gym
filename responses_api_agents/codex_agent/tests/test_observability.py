@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from nemo_gym.rollout_observability import AgentInvocation, ToolCallObservation
-from responses_api_agents.codex_agent.observability import read_codex_observations
+from responses_api_agents.codex_agent.observability import parse_codex_usage, read_codex_observations
 
 
 @pytest.mark.parametrize("exit_code", [0, 7])
@@ -77,3 +77,40 @@ def test_multiple_native_session_files_preserve_record_boundaries(tmp_path: Path
     bundle = read_codex_observations(tmp_path, "invocation", returncode=0, timed_out=False)
     assert len(bundle.records[0].conversation) == 2
     assert not bundle.gaps
+
+
+def test_native_usage_uses_latest_cumulative_total_without_adding_details() -> None:
+    records = []
+    for count in (20, 41):
+        records.append(
+            json.dumps(
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "total_token_usage": {
+                                "input_tokens": count,
+                                "output_tokens": 8,
+                                "total_tokens": count + 8,
+                                "cached_input_tokens": 0,
+                                "reasoning_output_tokens": 0,
+                            }
+                        },
+                    },
+                }
+            )
+        )
+    records.extend(["malformed", json.dumps({"type": "event_msg", "payload": {"type": "token_count", "info": None}})])
+    usage = parse_codex_usage("\n".join(records))
+    assert usage.input_tokens == 41
+    assert usage.output_tokens == 8
+    assert usage.total_tokens == 49
+    assert usage.input_tokens_details.cached_tokens is None
+    assert usage.output_tokens_details.reasoning_tokens is None
+
+
+@pytest.mark.parametrize("usage", [None, {}, {"input_tokens": True, "output_tokens": 8, "total_tokens": 9}])
+def test_missing_or_invalid_native_usage_is_unknown(usage: object) -> None:
+    record = {"type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": usage}}}
+    assert parse_codex_usage(json.dumps(record)) is None

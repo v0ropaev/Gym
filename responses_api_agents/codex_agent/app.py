@@ -66,7 +66,11 @@ from nemo_gym.sandbox.access import DirectSandboxConnection
 from nemo_gym.sandbox.config import resolve_provider_config
 from nemo_gym.server_utils import get_global_config_dict, get_response_json, raise_for_status
 from nemo_gym.skills import stage_skills
-from responses_api_agents.codex_agent.observability import parse_codex_observations, read_codex_observations
+from responses_api_agents.codex_agent.observability import (
+    parse_codex_observations,
+    parse_codex_usage,
+    read_codex_observations,
+)
 from responses_api_agents.codex_agent.sandbox import CodexSandboxSession
 from responses_api_agents.codex_agent.setup_codex import ensure_codex
 from responses_api_agents.codex_agent.transport import rate_limit_proxy
@@ -785,7 +789,28 @@ class CodexAgent(SimpleResponsesAPIAgent):
             and failure is None
             and (output_limited or (cleanup["timed_out"] and not errors))
         )
-        if not ((successful_exit and not errors) or gradable_limit):
+        terminal_error = next(
+            (
+                (event.get("error") or {}).get("message")
+                for _, event in reversed(events)
+                if event.get("type") == "turn.failed"
+            ),
+            None,
+        )
+        # A terminal model-request rejection is a failed agent outcome. The pinned
+        # CLI exits 1 for it; independent worker or supervision failures still raise.
+        model_rejection = (
+            state.model_attempt_statuses is not None
+            and state.model_attempt_statuses[-1:] == [400]
+            and terminal_events[-1:] == ["turn.failed"]
+            and bool(terminal_error)
+            and cleanup is not None
+            and cleanup["return_code"] == 1
+            and not cleanup["error"]
+            and not cleanup["timed_out"]
+            and failure is None
+        )
+        if not ((successful_exit and not errors) or gradable_limit or model_rejection):
             errors = [*startup_warnings, *compaction_warnings, *errors]
             startup_warnings = []
             compaction_warnings = []
@@ -797,6 +822,20 @@ class CodexAgent(SimpleResponsesAPIAgent):
         if cleanup and not completed and not cleanup["timed_out"] and not output_limited:
             error = error or "Codex ended without turn.completed"
         status = "failed" if error else "incomplete" if cleanup["timed_out"] or output_limited else "completed"
+        response_usage = NeMoGymResponseUsage(
+            input_tokens=usage["input_tokens"],
+            output_tokens=usage["output_tokens"],
+            total_tokens=usage["input_tokens"] + usage["output_tokens"],
+            input_tokens_details=NeMoGymResponseInputTokensDetails(cached_tokens=usage["cached_input_tokens"]),
+            output_tokens_details=NeMoGymResponseOutputTokensDetails(reasoning_tokens=usage["reasoning_tokens"]),
+        )
+        if model_rejection and not completed:
+            native_usage = parse_codex_usage(state.native_transcript)
+            if native_usage is not None:
+                response_usage = native_usage
+            elif output or 200 in state.model_attempt_statuses:
+                # Prior work without a usage artifact is unknown, not a zero-token run.
+                response_usage = None
         conversation = [NeMoGymEasyInputMessage(role="user", content=prompt)]
         if system:
             conversation.insert(0, NeMoGymEasyInputMessage(role="system", content=system))
@@ -807,11 +846,17 @@ class CodexAgent(SimpleResponsesAPIAgent):
             *(ObservationGap(code="model_metadata_fallback", detail=warning) for warning in startup_warnings),
             *(ObservationGap(code="compaction_accuracy_advisory", detail=warning) for warning in compaction_warnings),
         ]
-        for field, code in (
-            ("cached_input_tokens", "cached_token_usage_unavailable"),
-            ("reasoning_tokens", "reasoning_token_usage_unavailable"),
+        for count, code in (
+            (
+                response_usage.input_tokens_details.cached_tokens if response_usage else None,
+                "cached_token_usage_unavailable",
+            ),
+            (
+                response_usage.output_tokens_details.reasoning_tokens if response_usage else None,
+                "reasoning_token_usage_unavailable",
+            ),
         ):
-            if usage[field] is None:
+            if count is None:
                 gaps.append(ObservationGap(code=code, detail="CLI detail counters are absent or defaulted to zero"))
         stream_errors = [event for _, event in events if event.get("type") == "error"]
         if not completed or stream_errors:
@@ -899,23 +944,9 @@ class CodexAgent(SimpleResponsesAPIAgent):
             native.records[0].status = "incomplete" if failure else status
             native.gaps.extend(gap for gap in gaps if gap.code != "model_call_join_key_unavailable")
             state.observations = native
-        # A rejected initial request produced no policy decision. Preserve the failed
-        # invocation for health, but let the environment actually grade its empty output.
-        initial_rejection = (
-            state.model_attempt_statuses == [400]
-            and terminal_events[-1:] == ["turn.failed"]
-            and not output
-            and usage["input_tokens"] == 0
-            and usage["output_tokens"] == 0
-            and cleanup is not None
-            and cleanup["return_code"] == 1
-            and not cleanup["error"]
-            and not cleanup["timed_out"]
-            and failure is None
-        )
         if failure is not None:
             raise failure
-        if error and not initial_rejection:
+        if error and not model_rejection:
             raise HTTPException(502, f"Codex execution failed: {error}")
         return NeMoGymResponse(
             id=f"resp_{uuid4().hex}",
@@ -925,17 +956,11 @@ class CodexAgent(SimpleResponsesAPIAgent):
             output=output,
             status=status,
             incomplete_details={"reason": "max_output_tokens"} if output_limited else None,
-            error={"code": "server_error", "message": error} if initial_rejection else None,
+            error={"code": "server_error", "message": terminal_error} if model_rejection else None,
             tool_choice=body.tool_choice,
             tools=body.tools,
             parallel_tool_calls=body.parallel_tool_calls,
-            usage=NeMoGymResponseUsage(
-                input_tokens=usage["input_tokens"],
-                output_tokens=usage["output_tokens"],
-                total_tokens=usage["input_tokens"] + usage["output_tokens"],
-                input_tokens_details=NeMoGymResponseInputTokensDetails(cached_tokens=usage["cached_input_tokens"]),
-                output_tokens_details=NeMoGymResponseOutputTokensDetails(reasoning_tokens=usage["reasoning_tokens"]),
-            ),
+            usage=response_usage,
             metadata={
                 "harness_execution": "sandbox",
                 **({"harness_hostname": runtime.hostname, "harness_pid": str(runtime.pid)} if runtime else {}),

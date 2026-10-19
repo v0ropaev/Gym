@@ -10,11 +10,51 @@ from pathlib import Path
 
 from pydantic import TypeAdapter, ValidationError
 
-from nemo_gym.openai_utils import NeMoGymResponseInputItem
+from nemo_gym.openai_utils import (
+    NeMoGymResponseInputItem,
+    NeMoGymResponseInputTokensDetails,
+    NeMoGymResponseOutputTokensDetails,
+    NeMoGymResponseUsage,
+)
 from nemo_gym.rollout_observability import AgentInvocation, AgentObservationBundle, ObservationGap, ToolCallObservation
 
 
 _ITEM = TypeAdapter(NeMoGymResponseInputItem)
+
+
+def parse_codex_usage(transcript: str | None) -> NeMoGymResponseUsage | None:
+    """Read the latest native cumulative totals when a failed turn omits CLI usage.
+
+    These totals already include cached input and reasoning output. As in the CLI
+    parser, zero detail counters cannot distinguish absent provider measurements.
+    """
+    for line in reversed((transcript or "").splitlines()):
+        try:
+            event = json.loads(line)
+            if event["type"] != "event_msg" or event["payload"]["type"] != "token_count":
+                continue
+            usage = event["payload"]["info"]["total_token_usage"]
+            if any(
+                type(usage[key]) is not int or usage[key] < 0
+                for key in ("input_tokens", "output_tokens", "total_tokens")
+            ):
+                continue
+            cached = usage.get("cached_input_tokens")
+            reasoning = usage.get("reasoning_output_tokens")
+            return NeMoGymResponseUsage(
+                input_tokens=usage["input_tokens"],
+                output_tokens=usage["output_tokens"],
+                total_tokens=usage["total_tokens"],
+                input_tokens_details=NeMoGymResponseInputTokensDetails(
+                    cached_tokens=cached if type(cached) is int and cached > 0 else None
+                ),
+                output_tokens_details=NeMoGymResponseOutputTokensDetails(
+                    reasoning_tokens=reasoning if type(reasoning) is int and reasoning > 0 else None
+                ),
+            )
+        except (ValueError, TypeError, KeyError):
+            continue
+    return None
 
 
 def read_codex_observations(
