@@ -118,7 +118,7 @@ def main() -> None:
         files = list((directory / "home/.codex/sessions").glob("**/*.jsonl"))
         if files:
             (directory / "native_session.jsonl").write_text(
-                "\n".join(path.read_text(errors="replace") for path in files)
+                "\n".join(line for path in files for line in path.read_text(errors="replace").splitlines())
             )
         return
     params = json.loads(Path(sys.argv[1]).read_text())

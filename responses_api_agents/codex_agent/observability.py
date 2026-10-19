@@ -23,7 +23,7 @@ def read_codex_observations(
     """Use native call IDs; never join CLI display item IDs to calls by ordering."""
     files = list(home.glob("sessions/**/*.jsonl"))
     return parse_codex_observations(
-        "\n".join(path.read_text(errors="replace") for path in files) if files else None,
+        "\n".join(line for path in files for line in path.read_text(errors="replace").splitlines()) if files else None,
         invocation_id,
         returncode=returncode,
         timed_out=timed_out,

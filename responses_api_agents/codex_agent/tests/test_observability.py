@@ -58,3 +58,22 @@ def test_malformed_native_record_reports_gap_without_losing_invocation(tmp_path:
     assert bundle.records[0].invocation_id == "invocation"
     assert bundle.records[0].status == "failed"
     assert [gap.code for gap in bundle.gaps] == ["agent_artifact_record_unparseable"]
+
+
+def test_multiple_native_session_files_preserve_record_boundaries(tmp_path: Path) -> None:
+    folder = tmp_path / "sessions"
+    folder.mkdir()
+    for index in range(2):
+        record = {
+            "type": "response_item",
+            "timestamp": f"2026-10-19T12:00:0{index}Z",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": f"message {index}"}],
+            },
+        }
+        (folder / f"episode-{index}.jsonl").write_text(json.dumps(record) + "\n")
+    bundle = read_codex_observations(tmp_path, "invocation", returncode=0, timed_out=False)
+    assert len(bundle.records[0].conversation) == 2
+    assert not bundle.gaps
