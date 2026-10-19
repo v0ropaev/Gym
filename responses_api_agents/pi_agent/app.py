@@ -755,6 +755,7 @@ class PiAgent(SimpleResponsesAPIAgent):
                     self.config.model_server,
                     [*conversation, *output],
                     transcript_available=bool(output),
+                    capture_correlated=True,
                 )
             except Exception:
                 LOG.exception("failed to build interrupted Pi observations")
@@ -818,6 +819,22 @@ class PiAgent(SimpleResponsesAPIAgent):
             # Expected model limits/interruptions do not invalidate partial work.
             # They must not erase an independently confirmed worker or cleanup failure.
             terminal_error = None
+        # Pi 0.80.2 retains APIError.message but drops its status field. Its pinned
+        # SDK prefixes HTTP rejections with the status (covered by real SDK tests).
+        # Only an initial, empty HTTP 400 with a cleanly finished CLI is gradable;
+        # authentication, transport, partial generation and worker failures still raise.
+        initial_rejection = (
+            terminal_error is not None
+            and terminal_error.startswith("400 ")
+            and stop_reasons == ["error"]
+            and not output
+            and not any(usage.values())
+            and any(event.get("type") == "agent_end" for _, event in events)
+            and cleanup["return_code"] == 0
+            and cleanup["error"] is None
+            and not cleanup["timed_out"]
+            and not model_limit
+        )
         error = cleanup["error"] or terminal_error
         if cleanup["return_code"] not in (None, 0) and not cleanup["timed_out"] and not model_limit:
             error = error or f"Pi exited with code {cleanup['return_code']}"
@@ -865,6 +882,7 @@ class PiAgent(SimpleResponsesAPIAgent):
                 self.config.model_server,
                 [*conversation_input, *output],
                 transcript_available=bool(output),
+                capture_correlated=True,
             )
         except Exception:
             # Observation parsing must not turn a valid response/patch into a
@@ -889,9 +907,8 @@ class PiAgent(SimpleResponsesAPIAgent):
                     detail="Pi cache counters are absent, invalid, or defaulted to zero",
                 )
             )
-        if error:
-            # Keep the captured trajectory on session state for close, but do not invoke
-            # the benchmark verifier after a provider/runtime failure (same as Hermes).
+        if error and not initial_rejection:
+            # Keep evidence for close, but preserve infrastructure failures as failed episodes.
             raise RuntimeError(f"Pi agent failed: {error}")
         return response
 

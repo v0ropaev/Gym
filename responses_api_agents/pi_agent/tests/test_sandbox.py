@@ -1418,6 +1418,80 @@ async def test_provider_failure_is_not_gradable_but_context_limit_preserves_patc
     sandbox.stop.assert_not_awaited()
 
 
+async def test_session_retry_ownership_uses_provider_correlation(setup) -> None:
+    agent, sandbox = setup
+    failure = {
+        "type": "message_end",
+        "message": {"role": "assistant", "content": [], "stopReason": "error", "errorMessage": "429 retry"},
+    }
+    sandbox.events = json.dumps([0.0, failure]) + "\n" + events()
+    request, session_id, task = await activate(agent, sandbox)
+    response = await task
+    assert response.status == "completed"
+    provider = json.loads(sandbox.files[f"{sandbox.directory}/home/.pi/agent/models.json"])["providers"]["nemo"]
+    assert provider["headers"] == {"x-session-id": "pi-smoke-a2"}
+    close = await agent.close_agent_session(request, AgentCloseSessionRequest(**close_body(session_id)))
+    root = close.agent_observations.records[0]
+    assert root.invocation_id == provider["headers"]["x-session-id"]
+    assert len(root.model_calls) == 2  # Failed attempts join later through capture, without fake response IDs.
+    assert "model_call_ownership_unavailable" not in [gap.code for gap in close.agent_observations.gaps]
+
+
+@pytest.mark.parametrize(
+    "error_message,return_code,content,prior_turn,ended,gradable",
+    [
+        ("400 rejected request", 0, [], False, True, True),
+        ("401 invalid key", 0, [], False, True, False),
+        ("429 exhausted retries", 0, [], False, True, False),
+        ("503 unavailable", 0, [], False, True, False),
+        ("Connection error.", 0, [], False, True, False),
+        ("upstream error 400", 0, [], False, True, False),
+        (" 400 rejected request", 0, [], False, True, False),
+        ("4000 unknown error", 0, [], False, True, False),
+        ("400 rejected request", 1, [], False, True, False),
+        ("400 rejected request", 137, [], False, True, False),
+        ("400 rejected request", None, [], False, True, False),
+        ("400 rejected request", 0, [{"type": "text", "text": "partial"}], False, True, False),
+        ("400 rejected request", 0, [], True, True, False),
+        ("400 rejected request", 0, [], False, False, False),
+    ],
+)
+async def test_initial_http_400_rejection_retains_a_failed_response_for_verification(
+    setup, error_message, return_code, content, prior_turn, ended, gradable
+) -> None:
+    agent, sandbox = setup
+    message = {
+        "role": "assistant",
+        "content": content,
+        "stopReason": "error",
+        "errorMessage": error_message,
+        "usage": {"input": 0, "output": 0, "cacheRead": 0},
+    }
+    recorded = [{"type": "message_end", "message": message}]
+    if prior_turn:
+        recorded.insert(0, {"type": "message_end", "message": {**message, "stopReason": "stop"}})
+    if ended:
+        recorded.append({"type": "agent_end", "messages": [message]})
+    sandbox.events = "\n".join(json.dumps([float(i), event]) for i, event in enumerate(recorded))
+    sandbox.result["return_code"] = return_code
+    request, session_id, task = await activate(agent, sandbox)
+    if gradable:
+        response = await task
+        assert response.status == "failed"
+        assert response.error.message == error_message
+        assert response.output == []
+        assert response.usage.total_tokens == 0
+    else:
+        with pytest.raises(RuntimeError, match="Pi agent failed"):
+            await task
+    close = await agent.close_agent_session(request, AgentCloseSessionRequest(**close_body(session_id)))
+    root = close.agent_observations.records[0]
+    assert root.status == ("failed" if ended else "unknown")
+    assert root.model_calls == []
+    assert [item.role for item in root.conversation if hasattr(item, "role")][:1] == ["user"]
+    sandbox.launch.assert_awaited_once()
+
+
 @pytest.mark.parametrize("owned", [False, True])
 def test_sandbox_source_controls_ownership_and_native_routing(setup, owned):
     agent, sandbox = setup
