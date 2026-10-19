@@ -80,16 +80,16 @@ def _resolved_config():
     )
 
 
-@pytest.mark.parametrize("model_rejected", [False, True])
+@pytest.mark.parametrize("outcome", ["completed", "initial-rejection", "later-rejection"])
 async def test_session_composition_routes_collector_through_environment_and_responses(
-    setup, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, model_rejected: bool
+    setup, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, outcome: str
 ):
     agent, sandbox = setup
-    if model_rejected:
-        sandbox.events = rejected_events()
+    if outcome != "completed":
+        sandbox.events = rejected_events(after_work=outcome == "later-rejection")
         sandbox.result["return_code"] = 1
         capture_observations(sandbox, tmp_path)
-    reward = 0.0 if model_rejected else 1.0
+    reward = {"completed": 1.0, "initial-rejection": 0.0, "later-rejection": 0.5}[outcome]
     monkeypatch.chdir(Path(__file__).resolve().parents[3])
     # The benchmark's existing allowlist is unchanged; this integration is opt-in.
     monkeypatch.setenv("NEMO_GYM_ALLOW_UNSUPPORTED_PAIRING", "1")
@@ -200,9 +200,9 @@ async def test_session_composition_routes_collector_through_environment_and_resp
     assert calls[0][0] == environment_name
     assert calls[3][2]["input"] == "Fix the code"
     assert "grader-only" not in json.dumps(calls[3][2])
-    if model_rejected:
+    assert responses_body["status"] == ("completed" if outcome == "completed" else "failed")
+    if outcome == "initial-rejection":
         assert responses_body["output"] == []
-        assert responses_body["status"] == "failed"
         assert responses_body["usage"]["total_tokens"] == 0
     else:
         assert responses_body["output"][-1]["content"][0]["text"] == "Fixed"

@@ -70,10 +70,10 @@ def events() -> str:
     )
 
 
-def rejected_events() -> str:
-    """OpenCode's persisted first-request rejection has no provider steps or output."""
+def rejected_events(*, after_work: bool = False) -> str:
+    """Persist a terminal request rejection, optionally after a completed model turn."""
     export = json.loads(events())
-    export["messages"][-1] = {
+    rejected = {
         "info": {
             "role": "assistant",
             "time": {"created": 99, "completed": 100},
@@ -85,6 +85,10 @@ def rejected_events() -> str:
         },
         "parts": [],
     }
+    if after_work:
+        export["messages"].append(rejected)
+    else:
+        export["messages"][-1] = rejected
     return json.dumps(export)
 
 
@@ -808,21 +812,13 @@ def test_partial_output_survives_model_failure_and_timeout(setup, kind, tmp_path
     sandbox.disconnect.assert_awaited_once()
 
 
-@pytest.mark.parametrize(
-    "case", ["rejected", "server-error", "partial", "cleanup-error", "timeout", "auxiliary", "usage", "zero-exit"]
-)
-def test_only_initial_http400_is_returned_for_verification(setup, tmp_path, case):
+@pytest.mark.parametrize("case", ["initial", "later", "partial", "auxiliary", "usage", "unknown-usage"])
+def test_terminal_http400_preserves_output_and_usage_for_verification(setup, tmp_path, case):
     agent, sandbox = setup
-    export = json.loads(rejected_events())
+    export = json.loads(rejected_events(after_work=case == "later"))
     sandbox.result["return_code"] = 1
-    if case == "server-error":
-        export["messages"][-1]["info"]["error"]["data"]["statusCode"] = 500
-    elif case == "partial":
+    if case == "partial":
         export["messages"][-1]["parts"] = [{"type": "text", "text": "partial output"}]
-    elif case == "cleanup-error":
-        sandbox.result["error"] = "worker failed"
-    elif case == "timeout":
-        sandbox.result["timed_out"] = True
     elif case == "auxiliary":
         export["usage_messages"] = [
             export["messages"][-1]["info"],
@@ -830,38 +826,101 @@ def test_only_initial_http400_is_returned_for_verification(setup, tmp_path, case
         ]
     elif case == "usage":
         export["messages"][-1]["info"]["tokens"]["output"] = 1
-    elif case == "zero-exit":
-        sandbox.result["return_code"] = 0
+    elif case == "unknown-usage":
+        del export["messages"][-1]["info"]["tokens"]
     sandbox.events = json.dumps(export)
     capture_observations(sandbox, tmp_path)
     with TestClient(agent.setup_webserver()) as client:
         session_id = client.post("/v1/agent_sessions", json=seed().model_dump(mode="json")).json()["agent_session_id"]
         response = client.post("/ng-rollout/opencode-smoke-a2/v1/responses", json={"input": "task"})
-        if case == "rejected":
-            assert response.status_code == 200, response.text
-            assert response.json()["status"] == "failed"
-            assert response.json()["output"] == []
-            assert response.json()["usage"]["total_tokens"] == 0
-            assert json.loads(response.json()["error"]["message"])["data"]["message"] == "model rejected request"
+        assert response.status_code == 200, response.text
+        assert response.json()["status"] == "failed"
+        if case == "later":
+            assert [part["type"] for part in response.json()["output"]] == [
+                "reasoning",
+                "function_call",
+                "function_call_output",
+                "message",
+            ]
+            assert response.json()["output"][-1]["content"][0]["text"] == "Fixed"
+        elif case == "partial":
+            assert response.json()["output"][-1]["content"][0]["text"] == "partial output"
         else:
-            assert response.status_code == 502, response.text
+            assert response.json()["output"] == []
+        if case == "unknown-usage":
+            assert response.json()["usage"] is None
+        else:
+            assert response.json()["usage"]["total_tokens"] == (
+                16 if case in {"later", "auxiliary"} else 1 if case == "usage" else 0
+            )
+        assert json.loads(response.json()["error"]["message"])["data"]["message"] == "model rejected request"
         closed = client.post("/v1/agent_sessions/close", json=close_body(session_id))
         assert closed.status_code == 200, closed.text
         invocation = next(
             record for record in closed.json()["agent_observations"]["records"] if record["kind"] == "agent_invocation"
         )
         assert invocation["status"] == "failed"
-        if case == "rejected":
-            observation = next(
-                record for record in closed.json()["agent_observations"]["records"] if record["kind"] == "sandbox"
-            )
-            assert (observation["outcome"], observation["exit_code"], observation["error_type"]) == (
-                "failed",
-                1,
-                "process_exit",
-            )
-        if case != "partial":
+        observation = next(
+            record for record in closed.json()["agent_observations"]["records"] if record["kind"] == "sandbox"
+        )
+        assert (observation["outcome"], observation["exit_code"], observation["error_type"]) == (
+            "failed",
+            1,
+            "process_exit",
+        )
+        if case not in {"later", "partial"}:
             assert [item["role"] for item in invocation["conversation"]] == ["user"]
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "auth",
+        "rate-limit",
+        "server-error",
+        "retryable",
+        "unterminated",
+        "not-last",
+        "cleanup-error",
+        "timeout",
+        "zero-exit",
+        "other-exit",
+    ],
+)
+def test_http400_does_not_mask_other_provider_or_execution_failures(setup, tmp_path, case):
+    agent, sandbox = setup
+    export = json.loads(rejected_events(after_work=True))
+    info = export["messages"][-1]["info"]
+    sandbox.result["return_code"] = 1
+    if case in {"auth", "rate-limit", "server-error"}:
+        info["error"]["data"]["statusCode"] = {"auth": 401, "rate-limit": 429, "server-error": 500}[case]
+    elif case == "retryable":
+        info["error"]["data"]["isRetryable"] = True
+    elif case == "unterminated":
+        del info["time"]["completed"]
+    elif case == "not-last":
+        export["messages"].append(json.loads(events())["messages"][-1])
+    elif case == "cleanup-error":
+        sandbox.result["error"] = "worker failed"
+    elif case == "timeout":
+        sandbox.result["timed_out"] = True
+    elif case in {"zero-exit", "other-exit"}:
+        sandbox.result["return_code"] = 0 if case == "zero-exit" else 2
+    sandbox.events = json.dumps(export)
+    capture_observations(sandbox, tmp_path)
+    with TestClient(agent.setup_webserver()) as client:
+        session_id = client.post("/v1/agent_sessions", json=seed().model_dump(mode="json")).json()["agent_session_id"]
+        response = client.post("/ng-rollout/opencode-smoke-a2/v1/responses", json={"input": "task"})
+        assert response.status_code == 502, response.text
+        if case == "cleanup-error":
+            assert "worker failed" in response.json()["detail"]
+        closed = client.post("/v1/agent_sessions/close", json=close_body(session_id))
+        closed.raise_for_status()
+        invocation = next(
+            record for record in closed.json()["agent_observations"]["records"] if record["kind"] == "agent_invocation"
+        )
+        assert invocation["status"] == "failed"
+        assert invocation["conversation"][-1]["content"][0]["text"] == "Fixed"
 
 
 @pytest.mark.parametrize(

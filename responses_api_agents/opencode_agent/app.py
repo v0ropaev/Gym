@@ -949,20 +949,17 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
             except Exception as exc:
                 error = error or f"OpenCode output parse failed: {exc}"
         result = state.session.cleanup
-        # A rejected first request is a scored agent outcome. Keep transport,
-        # cleanup, malformed-artifact and partial-generation failures exceptional.
-        initial_model_rejection = (
+        # A terminal HTTP 400 model-request rejection is a scored agent outcome, including
+        # after partial work. Independent worker, cleanup and parse failures still raise.
+        model_rejection = (
             error is None
             and failure is None
             and result is not None
             and not result["timed_out"]
             and result["error"] is None
             and result["return_code"] == 1
-            and (usage is None or usage.input_tokens == usage.output_tokens == usage.total_tokens == 0)
-            and self._initial_model_rejection(export)
+            and self._terminal_model_rejection(export)
         )
-        if initial_model_rejection:
-            usage = NeMoGymResponseUsage.sum_from_list([])
         runtime = state.runtime_info
         if runtime is None:
             state.observations.gaps.append(ObservationGap(code="runtime_info_unavailable"))
@@ -1014,7 +1011,7 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
                     sandbox_id=state.sandbox_id,
                     outcome="timeout" if result["timed_out"] else "failed" if error or failure else "completed",
                     exit_code=result["return_code"],
-                    error_type="process_exit" if initial_model_rejection else None,
+                    error_type="process_exit" if model_rejection else None,
                 )
             )
         state.observations.gaps.append(
@@ -1025,7 +1022,7 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
         )
         if failure is not None:
             raise failure
-        if error and not initial_model_rejection:
+        if error and not model_rejection:
             raise HTTPException(502, format_sandbox_error(error, stderr=state.stderr))
         return NeMoGymResponse(
             id=f"resp_{uuid4().hex}",
@@ -1036,9 +1033,7 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
             usage=usage,
             status=status,
             error=(
-                {"code": "server_error", "message": json.dumps(assistants[0]["error"])}
-                if initial_model_rejection
-                else None
+                {"code": "server_error", "message": json.dumps(assistants[-1]["error"])} if model_rejection else None
             ),
             tool_choice=body.tool_choice,
             tools=body.tools,
@@ -1052,15 +1047,12 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
         )
 
     @staticmethod
-    def _initial_model_rejection(export: dict[str, Any]) -> bool:
-        """Recognize a persisted HTTP 400 before any policy output or completed call."""
+    def _terminal_model_rejection(export: dict[str, Any]) -> bool:
+        """Recognize a terminal HTTP 400 recorded by the pinned OpenCode runtime."""
         messages = [message for message in export.get("messages", []) if message["info"].get("role") == "assistant"]
-        if len(messages) != 1 or messages[0].get("parts") != []:
+        if not messages:
             return False
-        info = messages[0]["info"]
-        usage_messages = export.get("usage_messages", [info])
-        if sum(message.get("role") == "assistant" for message in usage_messages) != 1:
-            return False
+        info = messages[-1]["info"]
         error = info.get("error")
         if not isinstance(error, dict) or error.get("name") != "APIError":
             return False
@@ -1070,6 +1062,7 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
             and data.get("statusCode") == 400
             and data.get("isRetryable") is False
             and info.get("finish") is None
+            and bool(info.get("time", {}).get("completed"))
         )
 
 
