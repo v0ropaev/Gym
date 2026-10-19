@@ -70,8 +70,27 @@ def events() -> str:
     )
 
 
+def rejected_events() -> str:
+    """OpenCode's persisted first-request rejection has no provider steps or output."""
+    export = json.loads(events())
+    export["messages"][-1] = {
+        "info": {
+            "role": "assistant",
+            "time": {"created": 99, "completed": 100},
+            "tokens": {"input": 0, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}},
+            "error": {
+                "name": "APIError",
+                "data": {"message": "model rejected request", "statusCode": 400, "isRetryable": False},
+            },
+        },
+        "parts": [],
+    }
+    return json.dumps(export)
+
+
 class Sandbox:
     def __init__(self):
+        self.sandbox_id = "provider-sandbox-id"
         self.files = {}
         self.result = {
             "return_code": 0,
@@ -790,6 +809,62 @@ def test_partial_output_survives_model_failure_and_timeout(setup, kind, tmp_path
 
 
 @pytest.mark.parametrize(
+    "case", ["rejected", "server-error", "partial", "cleanup-error", "timeout", "auxiliary", "usage", "zero-exit"]
+)
+def test_only_initial_http400_is_returned_for_verification(setup, tmp_path, case):
+    agent, sandbox = setup
+    export = json.loads(rejected_events())
+    sandbox.result["return_code"] = 1
+    if case == "server-error":
+        export["messages"][-1]["info"]["error"]["data"]["statusCode"] = 500
+    elif case == "partial":
+        export["messages"][-1]["parts"] = [{"type": "text", "text": "partial output"}]
+    elif case == "cleanup-error":
+        sandbox.result["error"] = "worker failed"
+    elif case == "timeout":
+        sandbox.result["timed_out"] = True
+    elif case == "auxiliary":
+        export["usage_messages"] = [
+            export["messages"][-1]["info"],
+            json.loads(events())["messages"][-1]["info"],
+        ]
+    elif case == "usage":
+        export["messages"][-1]["info"]["tokens"]["output"] = 1
+    elif case == "zero-exit":
+        sandbox.result["return_code"] = 0
+    sandbox.events = json.dumps(export)
+    capture_observations(sandbox, tmp_path)
+    with TestClient(agent.setup_webserver()) as client:
+        session_id = client.post("/v1/agent_sessions", json=seed().model_dump(mode="json")).json()["agent_session_id"]
+        response = client.post("/ng-rollout/opencode-smoke-a2/v1/responses", json={"input": "task"})
+        if case == "rejected":
+            assert response.status_code == 200, response.text
+            assert response.json()["status"] == "failed"
+            assert response.json()["output"] == []
+            assert response.json()["usage"]["total_tokens"] == 0
+            assert json.loads(response.json()["error"]["message"])["data"]["message"] == "model rejected request"
+        else:
+            assert response.status_code == 502, response.text
+        closed = client.post("/v1/agent_sessions/close", json=close_body(session_id))
+        assert closed.status_code == 200, closed.text
+        invocation = next(
+            record for record in closed.json()["agent_observations"]["records"] if record["kind"] == "agent_invocation"
+        )
+        assert invocation["status"] == "failed"
+        if case == "rejected":
+            observation = next(
+                record for record in closed.json()["agent_observations"]["records"] if record["kind"] == "sandbox"
+            )
+            assert (observation["outcome"], observation["exit_code"], observation["error_type"]) == (
+                "failed",
+                1,
+                "process_exit",
+            )
+        if case != "partial":
+            assert [item["role"] for item in invocation["conversation"]] == ["user"]
+
+
+@pytest.mark.parametrize(
     ("finish", "expected"),
     [
         ("stop", "completed"),
@@ -1109,6 +1184,7 @@ def test_sandbox_source_controls_ownership_and_session_routing(setup, owned):
         assert created.status_code == 200, created.text
         state = active_sessions(agent)[body.agent_session_id]
         assert state.session.owns_sandbox is owned
+        assert state.sandbox_id == sandbox.sandbox_id
         assert state.session.workdir == sandbox.expected_workdir
         resolve.assert_called_once_with("agent-provider" if owned else "sandbox", {})
         workspace_calls = [call for call in sandbox.exec.await_args_list if call.args[0].startswith("mkdir -p --")]
@@ -1131,6 +1207,11 @@ def test_sandbox_source_controls_ownership_and_session_routing(setup, owned):
         close_request = {"agent_session_id": body.agent_session_id, "episode_id": body.episode_id.model_dump()}
         closed = client.post("/v1/agent_sessions/close", json=close_request)
         assert closed.status_code == 200, closed.text
+        observation = next(
+            record for record in closed.json()["agent_observations"]["records"] if record["kind"] == "sandbox"
+        )
+        assert observation["sandbox_id"] == sandbox.sandbox_id
+        assert observation["provider"] == ("agent-provider" if owned else "sandbox")
         assert client.post("/v1/agent_sessions/close", json=close_request).json() == closed.json()
         if owned:
             sandbox.stop.assert_awaited_once()
