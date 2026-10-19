@@ -1980,3 +1980,137 @@ def test_task_timeout_metadata_reaches_sandbox_supervisor(
         assert response.json()["metadata"]["agent_timeout_sec"] == str(float(expected))
         closed = client.post("/v1/agent_sessions/close", json=close_body(session_id))
         assert closed.status_code == 200, closed.text
+
+
+def native_transcript(items):
+    return "\n".join(
+        json.dumps({"type": "response_item", "timestamp": f"2026-10-19T12:00:0{index}Z", "payload": item})
+        for index, item in enumerate(items)
+    )
+
+
+def test_session_uses_native_call_identity_arguments_and_results(setup):
+    agent, sandbox = setup
+    native_output = "Process exited with code 7\nOutput:\noriginal result"
+    transcript = native_transcript(
+        [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "task"}]},
+            {
+                "type": "function_call",
+                "call_id": "provider-call",
+                "name": "exec_command",
+                "arguments": '{"cmd":"exit 7"}',
+            },
+            {"type": "function_call_output", "call_id": "provider-call", "output": native_output},
+        ]
+    )
+    original_publish = sandbox.publish
+
+    def publish():
+        original_publish()
+        sandbox.files[f"{sandbox.directory}/native_session.jsonl"] = transcript
+        sandbox.files[f"{sandbox.directory}/model_attempts.jsonl"] = '{"status":200}\n'
+
+    sandbox.publish = publish
+    with TestClient(agent.setup_webserver()) as client:
+        session_id = client.post("/v1/agent_sessions", json=seed().model_dump(mode="json")).json()["agent_session_id"]
+        response = client.post("/ng-rollout/codex-smoke-a2/v1/responses", json={"input": "task"})
+        assert response.status_code == 200, response.text
+        payload = json.loads(sandbox.files[f"{sandbox.directory}/input.json"])
+        assert "--ephemeral" not in payload["command"]
+        assert payload["invocation_id"] == "codex-smoke-a2"
+        assert payload["model_base_url"] == "http://model.example:9000/ng-rollout/codex-smoke-a2/v1"
+        config = tomllib.loads(sandbox.files[f"{sandbox.directory}/home/.codex/config.toml"])
+        assert config["model_providers"]["gym"]["http_headers"] == {"x-session-id": "codex-smoke-a2"}
+        closed = client.post("/v1/agent_sessions/close", json=close_body(session_id)).json()
+    bundle = closed["agent_observations"]
+    invocation, tool = bundle["records"]
+    assert invocation["conversation"][1]["call_id"] == tool["tool_call_id"] == "provider-call"
+    assert invocation["conversation"][1]["arguments"] == '{"cmd":"exit 7"}'
+    assert invocation["conversation"][2]["output"] == native_output
+    assert tool["status"] == "failed" and tool["error_type"] == "nonzero_exit"
+    assert not any(gap["code"] == "model_call_join_key_unavailable" for gap in bundle["gaps"])
+
+
+@pytest.mark.parametrize(
+    "statuses,partial,timed_out,returncode,tokens",
+    [
+        ([400], False, False, 1, 0),
+        ([401], False, False, 1, 0),
+        ([500], False, False, 1, 0),
+        ([200, 400], False, False, 1, 0),
+        ([400], True, False, 1, 0),
+        ([400], False, True, 1, 0),
+        ([400], False, False, None, 0),
+        ([400], False, False, 0, 0),
+        ([400], False, False, 7, 0),
+        ([400], False, False, 1, 5),
+    ],
+)
+def test_only_initial_http400_rejection_returns_gradable_failed_response(
+    setup, statuses, partial, timed_out, returncode, tokens
+):
+    agent, sandbox = setup
+    sandbox.result.update(return_code=returncode, timed_out=timed_out)
+    records = [
+        {"type": "turn.started"},
+        *(
+            [{"type": "item.completed", "item": {"id": "partial", "type": "agent_message", "text": "partial"}}]
+            if partial
+            else []
+        ),
+        {"type": "turn.failed", "error": {"message": "model rejected request"}},
+    ]
+    if tokens:
+        records.insert(1, {"type": "turn.completed", "usage": {"input_tokens": tokens, "output_tokens": 0}})
+    sandbox.events = "\n".join(json.dumps([float(i), event]) for i, event in enumerate(records))
+    original_publish = sandbox.publish
+
+    def publish():
+        original_publish()
+        sandbox.files[f"{sandbox.directory}/native_session.jsonl"] = native_transcript(
+            [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "task"}]}]
+        )
+        sandbox.files[f"{sandbox.directory}/model_attempts.jsonl"] = "\n".join(
+            json.dumps({"status": status}) for status in statuses
+        )
+
+    sandbox.publish = publish
+    accepted = statuses == [400] and not partial and not timed_out and returncode == 1 and tokens == 0
+    with TestClient(agent.setup_webserver()) as client:
+        session_id = client.post("/v1/agent_sessions", json=seed().model_dump(mode="json")).json()["agent_session_id"]
+        response = client.post("/ng-rollout/codex-smoke-a2/v1/responses", json={"input": "task"})
+        assert response.status_code == (200 if accepted else 502), response.text
+        if accepted:
+            body = response.json()
+            assert body["status"] == "failed"
+            assert body["error"] == {"code": "server_error", "message": "model rejected request"}
+            assert body["output"] == []
+            assert body["usage"]["total_tokens"] == 0
+        closed = client.post("/v1/agent_sessions/close", json=close_body(session_id)).json()
+        invocation = closed["agent_observations"]["records"][0]
+        assert invocation["status"] == "failed"
+        assert all(item.get("role") == "user" for item in invocation["conversation"])
+
+
+@pytest.mark.asyncio
+async def test_failed_native_snapshot_preserves_collected_cli_events(setup):
+    agent, sandbox = setup
+    state = await agent._seed_agent_session_state(seed())
+    original_execute = sandbox.execute
+
+    async def execute(command, **kwargs):
+        if "--snapshot" in command:
+            raise OSError("snapshot transport failed")
+        return await original_execute(command, **kwargs)
+
+    sandbox.exec.side_effect = execute
+    try:
+        response = await agent._sandbox_response(
+            state, NeMoGymResponseCreateParamsNonStreaming(input="task"), prompt="task", system=""
+        )
+        assert response.output[-1].content[0].text == "Fixed"
+        assert state.observations.records[0].conversation[-1].content[0].text == "Fixed"
+        assert any(gap.code == "model_call_join_key_unavailable" for gap in state.observations.gaps)
+    finally:
+        await state.close(1)
