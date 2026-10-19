@@ -819,35 +819,32 @@ class PiAgent(SimpleResponsesAPIAgent):
             # Expected model limits/interruptions do not invalidate partial work.
             # They must not erase an independently confirmed worker or cleanup failure.
             terminal_error = None
-        # Pi 0.80.2 retains APIError.message but drops its status field. Its pinned
-        # SDK prefixes HTTP rejections with the status (covered by real SDK tests).
-        # Only an initial, empty HTTP 400 with a cleanly finished CLI is gradable;
-        # authentication, transport, partial generation and worker failures still raise.
-        initial_rejection = (
-            terminal_error is not None
-            and terminal_error.startswith("400 ")
-            and stop_reasons == ["error"]
-            and not output
-            and not any(usage.values())
-            and any(event.get("type") == "agent_end" for _, event in events)
-            and cleanup["return_code"] == 0
-            and cleanup["error"] is None
-            and not cleanup["timed_out"]
-            and not model_limit
-        )
-        error = cleanup["error"] or terminal_error
+        execution_error = cleanup["error"]
         if cleanup["return_code"] not in (None, 0) and not cleanup["timed_out"] and not model_limit:
-            error = error or f"Pi exited with code {cleanup['return_code']}"
+            execution_error = execution_error or f"Pi exited with code {cleanup['return_code']}"
         if not stop_reasons:
             cached_tokens = None
-            error = error or "Pi produced no assistant result"
+            execution_error = execution_error or "Pi produced no assistant result"
         elif stop_reasons[-1] not in ("stop", "length", "error", "aborted") and not cleanup["timed_out"]:
-            error = error or "Pi ended without a terminal assistant result"
+            execution_error = execution_error or "Pi ended without a terminal assistant result"
         incomplete = (
             cleanup["timed_out"] or model_limit or (stop_reasons and stop_reasons[-1] in ("length", "aborted"))
         )
         if cleanup["timed_out"] and not stop_reasons and cleanup["error"] is None:
-            error = None
+            execution_error = None
+        error = execution_error or terminal_error
+        # Pi 0.80.2 retains APIError.message but drops its status field. Its pinned
+        # SDK prefixes HTTP rejections with the status (covered by real SDK tests).
+        # A terminal HTTP 400 remains a failed response for verification, including
+        # earlier output and usage. Other provider failures retain their error routing;
+        # execution failures independently prevent grading.
+        model_rejection = (
+            terminal_error is not None
+            and terminal_error.startswith("400 ")
+            and any(event.get("type") == "agent_end" for _, event in events)
+            and cleanup["return_code"] == 0
+            and not cleanup["timed_out"]
+        )
         response = NeMoGymResponse(
             id=f"resp_{uuid4().hex}",
             created_at=int(time()),
@@ -907,7 +904,7 @@ class PiAgent(SimpleResponsesAPIAgent):
                     detail="Pi cache counters are absent, invalid, or defaulted to zero",
                 )
             )
-        if error and not initial_rejection:
+        if execution_error or (terminal_error and not model_rejection):
             # Keep evidence for close, but preserve infrastructure failures as failed episodes.
             raise RuntimeError(f"Pi agent failed: {error}")
         return response

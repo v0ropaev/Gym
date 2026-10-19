@@ -1437,59 +1437,107 @@ async def test_session_retry_ownership_uses_provider_correlation(setup) -> None:
     assert "model_call_ownership_unavailable" not in [gap.code for gap in close.agent_observations.gaps]
 
 
-@pytest.mark.parametrize(
-    "error_message,return_code,content,prior_turn,ended,gradable",
-    [
-        ("400 rejected request", 0, [], False, True, True),
-        ("401 invalid key", 0, [], False, True, False),
-        ("429 exhausted retries", 0, [], False, True, False),
-        ("503 unavailable", 0, [], False, True, False),
-        ("Connection error.", 0, [], False, True, False),
-        ("upstream error 400", 0, [], False, True, False),
-        (" 400 rejected request", 0, [], False, True, False),
-        ("4000 unknown error", 0, [], False, True, False),
-        ("400 rejected request", 1, [], False, True, False),
-        ("400 rejected request", 137, [], False, True, False),
-        ("400 rejected request", None, [], False, True, False),
-        ("400 rejected request", 0, [{"type": "text", "text": "partial"}], False, True, False),
-        ("400 rejected request", 0, [], True, True, False),
-        ("400 rejected request", 0, [], False, False, False),
-    ],
-)
-async def test_initial_http_400_rejection_retains_a_failed_response_for_verification(
-    setup, error_message, return_code, content, prior_turn, ended, gradable
+@pytest.mark.parametrize("prior_turn", [False, True])
+@pytest.mark.parametrize("partial_output", [False, True])
+async def test_http_400_rejection_preserves_output_and_usage_for_verification(
+    setup: tuple[PiAgent, Sandbox], prior_turn: bool, partial_output: bool
 ) -> None:
     agent, sandbox = setup
     message = {
         "role": "assistant",
-        "content": content,
+        "content": [{"type": "text", "text": "partial answer"}] if partial_output else [],
         "stopReason": "error",
-        "errorMessage": error_message,
-        "usage": {"input": 0, "output": 0, "cacheRead": 0},
+        "errorMessage": "400 rejected request",
+        "usage": {"input": 5 if partial_output else 0, "output": 2 if partial_output else 0, "cacheRead": 0},
     }
-    recorded = [{"type": "message_end", "message": message}]
+    recorded = []
     if prior_turn:
-        recorded.insert(0, {"type": "message_end", "message": {**message, "stopReason": "stop"}})
+        recorded = [
+            {
+                "type": "message_end",
+                "message": {
+                    "role": "assistant",
+                    "responseId": "earlier-response",
+                    "content": [{"type": "text", "text": "earlier work"}],
+                    "stopReason": "stop",
+                    "usage": {"input": 7, "output": 3, "cacheRead": 2},
+                },
+            }
+        ]
+    recorded.extend(
+        [
+            {"type": "message_end", "message": message},
+            {"type": "agent_end", "messages": [message]},
+        ]
+    )
+    sandbox.events = "\n".join(json.dumps([float(i), event]) for i, event in enumerate(recorded))
+    request, session_id, task = await activate(agent, sandbox)
+    response = await task
+    assert response.status == "failed"
+    assert response.error.message == "400 rejected request"
+    expected_text = (["earlier work"] if prior_turn else []) + (["partial answer"] if partial_output else [])
+    assert [item.content[0].text for item in response.output] == expected_text
+    assert response.usage.input_tokens == (9 if prior_turn else 0) + (5 if partial_output else 0)
+    assert response.usage.output_tokens == (3 if prior_turn else 0) + (2 if partial_output else 0)
+    assert response.usage.total_tokens == (12 if prior_turn else 0) + (7 if partial_output else 0)
+    close = await agent.close_agent_session(request, AgentCloseSessionRequest(**close_body(session_id)))
+    root = close.agent_observations.records[0]
+    assert root.status == "failed"
+    assert [call.response_id for call in root.model_calls] == (["earlier-response"] if prior_turn else [])
+    assert len(root.conversation) == 1 + len(expected_text)  # No fabricated assistant turn for an empty rejection.
+    sandbox.launch.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    "error_message,return_code,ended,timed_out,expected_error",
+    [
+        ("401 invalid key", 0, True, False, "401 invalid key"),
+        ("429 exhausted retries", 0, True, False, "429 exhausted retries"),
+        ("503 unavailable", 0, True, False, "503 unavailable"),
+        ("Connection error.", 0, True, False, "Connection error"),
+        ("upstream error 400", 0, True, False, "upstream error 400"),
+        (" 400 rejected request", 0, True, False, "400 rejected request"),
+        ("4000 unknown error", 0, True, False, "4000 unknown error"),
+        ("400 rejected request", 1, True, False, "Pi exited with code 1"),
+        ("400 rejected request", 137, True, False, "Pi exited with code 137"),
+        ("400 rejected request", None, True, False, "400 rejected request"),
+        ("400 rejected request", 0, False, False, "400 rejected request"),
+        ("400 rejected request", 0, True, True, "400 rejected request"),
+    ],
+)
+async def test_model_rejection_does_not_hide_provider_or_execution_failure(
+    setup: tuple[PiAgent, Sandbox],
+    error_message: str,
+    return_code: int | None,
+    ended: bool,
+    timed_out: bool,
+    expected_error: str,
+) -> None:
+    agent, sandbox = setup
+    message = {"role": "assistant", "content": [], "stopReason": "error", "errorMessage": error_message}
+    recorded = [{"type": "message_end", "message": message}]
     if ended:
         recorded.append({"type": "agent_end", "messages": [message]})
     sandbox.events = "\n".join(json.dumps([float(i), event]) for i, event in enumerate(recorded))
-    sandbox.result["return_code"] = return_code
+    sandbox.result.update(return_code=return_code, timed_out=timed_out)
     request, session_id, task = await activate(agent, sandbox)
-    if gradable:
-        response = await task
-        assert response.status == "failed"
-        assert response.error.message == error_message
-        assert response.output == []
-        assert response.usage.total_tokens == 0
-    else:
-        with pytest.raises(RuntimeError, match="Pi agent failed"):
-            await task
+    with pytest.raises(RuntimeError, match=expected_error):
+        await task
     close = await agent.close_agent_session(request, AgentCloseSessionRequest(**close_body(session_id)))
-    root = close.agent_observations.records[0]
-    assert root.status == ("failed" if ended else "unknown")
-    assert root.model_calls == []
-    assert [item.role for item in root.conversation if hasattr(item, "role")][:1] == ["user"]
+    assert close.agent_observations.records
     sandbox.launch.assert_awaited_once()
+
+
+async def test_model_rejection_does_not_hide_cleanup_failure(setup: tuple[PiAgent, Sandbox]) -> None:
+    agent, sandbox = setup
+    recorded = [json.loads(line)[1] for line in events(stop_reason="error").splitlines()]
+    recorded[-2]["message"]["errorMessage"] = "400 rejected request"
+    sandbox.events = "\n".join(json.dumps([float(i), event]) for i, event in enumerate(recorded))
+    sandbox.result["error"] = "cleanup failed"
+    request, session_id, task = await activate(agent, sandbox)
+    with pytest.raises(RuntimeError, match="cleanup failed"):
+        await task
+    await agent.close_agent_session(request, AgentCloseSessionRequest(**close_body(session_id)))
 
 
 @pytest.mark.parametrize("owned", [False, True])
